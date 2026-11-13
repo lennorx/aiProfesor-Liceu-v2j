@@ -1,7 +1,10 @@
-streamlit>=1.40.0
-google-genai>=1.0.0
-supabase>=2.0.0
+streamlit==1.67.0  # fixat: st.components.v1.html e depreciat (data de eliminare 2026-06-01 a trecut)
+google-genai>=1.51.0,<3
+supabase>=2.18.0
 Pillow>=10.0.0
 lxml>=5.0.0
-bcrypt
-PyMuPDF
+python-docx
+dbfread
+cryptography>=42
+pypdf>=5.0        # PDF-uri mari: text extras local (BSD; înlocuiește PyMuPDF, care e AGPL)
+stripe>=12.0      # abonamente (Checkout, portal client)

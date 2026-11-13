@@ -4,1067 +4,252 @@ import streamlit.components.v1 as components
 from google import genai
 from google.genai import types as genai_types
 from supabase import create_client, Client
-import uuid
 import time
 import tempfile
 import os
 import random
 import re
-import bcrypt
-import secrets
 import hashlib
-import hmac as _hmac_module
-import base64 as _b64_module
-from datetime import datetime, timezone
+import hmac
+import smtplib
+from email.message import EmailMessage
+import secrets
+import threading
+from collections import defaultdict
+import pathlib
+
+import comercial
+
+# Pod bidirecțional Streamlit <-> localStorage pentru cheia API a elevului.
+# Fișierul key_bridge/index.html trebuie pus în repo, lângă acest script.
+_KEY_BRIDGE_DIR = pathlib.Path(__file__).resolve().parent / "key_bridge"
+_key_bridge = (
+    components.declare_component("profesor_key_bridge", path=str(_KEY_BRIDGE_DIR))
+    if (_KEY_BRIDGE_DIR / "index.html").exists() else None
+)
+
+# Pod localStorage -> Python pentru ID-ul conversației (restaurarea istoricului pe orice browser).
+# Fișierul session_bridge/index.html trebuie pus în repo, lângă acest script.
+_SESSION_BRIDGE_DIR = pathlib.Path(__file__).resolve().parent / "session_bridge"
+_session_bridge = (
+    components.declare_component("profesor_session_bridge", path=str(_SESSION_BRIDGE_DIR))
+    if (_SESSION_BRIDGE_DIR / "index.html").exists() else None
+)
+
+# === IMPORTURI PENTRU TIPURI NOI DE FIȘIERE ===
+# python-docx pentru .docx/.doc
+try:
+    from docx import Document as _DocxDocument
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
+
+# dbfread pentru .dbf
+try:
+    from dbfread import DBF as _DBF
+    _DBF_AVAILABLE = True
+except ImportError:
+    _DBF_AVAILABLE = False
 
 
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# === AUTENTIFICARE — Email + Parolă via Supabase ===
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Tabele Supabase necesare (rulează în SQL Editor):
-#
-# CREATE TABLE IF NOT EXISTS users (
-#   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-#   email TEXT UNIQUE NOT NULL,
-#   password_hash TEXT NOT NULL,
-#   role TEXT NOT NULL DEFAULT 'student',  -- 'student' | 'admin'
-#   display_name TEXT,
-#   clasa TEXT,
-#   materii_preferate TEXT[],
-#   created_at FLOAT NOT NULL,
-#   last_login FLOAT
-# );
-#
-# -- Tabel pentru "Rămâi logat" — tokeni de sesiune persistenti
-# CREATE TABLE IF NOT EXISTS remember_tokens (
-#   token TEXT PRIMARY KEY,
-#   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-#   created_at FLOAT NOT NULL,
-#   expires_at FLOAT NOT NULL,
-#   last_used FLOAT
-# );
-# CREATE INDEX IF NOT EXISTS idx_remember_tokens_user_id ON remember_tokens(user_id);
-#
-# ALTER TABLE sessions ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id);
-# ALTER TABLE history ADD COLUMN IF NOT EXISTS user_id UUID REFERENCES users(id);
-#
-# CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-# CREATE INDEX IF NOT EXISTS idx_history_user_id ON history(user_id);
-#
-# -- Tabel pentru Rate Limiting pe IP/sesiune
-# CREATE TABLE IF NOT EXISTS rate_limits (
-#   identifier TEXT NOT NULL,          -- IP sau session_id (hashed cu SHA-256)
-#   window_start FLOAT NOT NULL,       -- timestamp inceput fereastra curenta
-#   request_count INT NOT NULL DEFAULT 0,
-#   blocked_until FLOAT,               -- NULL daca nu e blocat
-#   PRIMARY KEY (identifier)
-# );
-# CREATE INDEX IF NOT EXISTS idx_rate_limits_identifier ON rate_limits(identifier);
-#
-# -- Tabel pentru Context Cache cross-session (persistenta Gemini cache names)
-# CREATE TABLE IF NOT EXISTS prompt_cache (
-#   cache_key TEXT PRIMARY KEY,        -- sha256(api_key_prefix:prompt_hash)[:16]
-#   cache_name TEXT NOT NULL,          -- "cachedContents/..." returnat de Gemini API
-#   expires_at FLOAT NOT NULL,         -- Unix timestamp expirare
-#   api_key_prefix TEXT NOT NULL,      -- primele 8 caractere ale cheii (pt. invalidare)
-#   created_at FLOAT NOT NULL
-# );
-# CREATE INDEX IF NOT EXISTS idx_prompt_cache_expires ON prompt_cache(expires_at);
-# ══════════════════════════════════════════════════════════════════════════════
+# === EXTRAGERE TEXT DIN FIȘIERE (txt, docx, doc, dbf, srt) ===
 
-_EMAIL_RE = re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$')
+# Tipuri de fișiere text acceptate suplimentar (nu pot fi trimise la Google Files API direct)
+_TEXT_FILE_TYPES = {
+    "text/plain":           ".txt",
+    "text/x-srt":          ".srt",
+    "application/x-subrip": ".srt",
+    # .docx
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    # .doc vechi
+    "application/msword":   ".doc",
+    # .dbf — nu are MIME standard, îl detectăm după extensie
+    "application/dbf":      ".dbf",
+    "application/dbase":    ".dbf",
+    "application/x-dbase":  ".dbf",
+}
 
-# ══════════════════════════════════════════════════════════════════════════════
-# === RATE LIMITING PE IP / SESIUNE ===
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Arhitectură:
-#   - Identificator: IP din st.context.headers (Streamlit >= 1.31) cu fallback
-#     pe session_id hashed. IP-ul este HASHED cu SHA-256 înainte de stocare —
-#     nu stocăm niciodată IP-uri în clar (GDPR compliance).
-#   - Stocare: Supabase (tabelul rate_limits) — persistent cross-restart.
-#     Fallback în session_state când Supabase e offline.
-#   - Strategie sliding window: fereastră de RL_WINDOW_SECONDS secunde,
-#     maxim RL_MAX_REQUESTS cereri per fereastră.
-#   - Blocare: după RL_MAX_REQUESTS cereri → blocat RL_BLOCK_SECONDS secunde.
-#
-# Configurabil din secrets.toml:
-#   RL_MAX_REQUESTS = 30     # cereri per fereastră (default: 30)
-#   RL_WINDOW_SECONDS = 60   # durata ferestrei în secunde (default: 60)
-#   RL_BLOCK_SECONDS = 120   # durata blocajului în secunde (default: 120)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _get_rl_config() -> tuple[int, int, int]:
-    """Citește configurația rate limiting din secrets cu valori default sigure."""
-    try:
-        max_req   = int(st.secrets.get("RL_MAX_REQUESTS",   30))
-        window    = int(st.secrets.get("RL_WINDOW_SECONDS", 60))
-        block_sec = int(st.secrets.get("RL_BLOCK_SECONDS", 120))
-    except Exception:
-        max_req, window, block_sec = 30, 60, 120
-    return max_req, window, block_sec
+# Extensii acceptate pentru fișierele text (folosite în st.file_uploader)
+_TEXT_FILE_EXTENSIONS = ["txt", "srt", "docx", "doc", "dbf"]
 
 
-def _get_client_identifier() -> str:
+def _extract_text_from_uploaded_file(uploaded_file) -> str | None:
+    """Extrage conținutul text dintr-un fișier text/docx/doc/dbf/srt.
+
+    Returnează textul extras ca string, sau None dacă extragerea eșuează.
+    Fișierele prea mari sunt trunchiate la MAX_TEXT_CHARS pentru a nu depăși
+    fereastra de context a modelului.
     """
-    Returnează un identificator unic per client, hashed cu SHA-256.
+    MAX_TEXT_CHARS = 400_000  # ~100k tokeni — acoperă subtitrări complete și documente mari
 
-    Prioritate:
-      1. IP din X-Forwarded-For (Streamlit Cloud pune IP-ul real aici)
-      2. IP din X-Real-IP
-      3. session_id (fallback când nu avem IP — ex: localhost)
+    fname = uploaded_file.name.lower()
+    ftype = (uploaded_file.type or "").lower()
+    raw_bytes = uploaded_file.getvalue()
 
-    IP-ul este hashed ÎNAINTE de stocare — nu înregistrăm IP-uri în clar.
-    """
-    raw_id = ""
-    try:
-        headers = st.context.headers  # disponibil Streamlit >= 1.31
-        # Streamlit Cloud / reverse proxy pun IP-ul clientului în X-Forwarded-For
-        xff = headers.get("X-Forwarded-For", "") or headers.get("x-forwarded-for", "")
-        if xff:
-            # X-Forwarded-For poate fi "IP1, IP2, IP3" — primul e clientul real
-            raw_id = xff.split(",")[0].strip()
-        if not raw_id:
-            raw_id = headers.get("X-Real-IP", "") or headers.get("x-real-ip", "")
-    except Exception:
-        pass
-    # Fallback: session_id (unic per browser, nu per IP — mai puțin strict)
-    if not raw_id:
-        raw_id = st.session_state.get("session_id", "") or str(uuid.uuid4())
-        # Marchăm că folosim session_id ca fallback — logăm o singură dată
-        if not st.session_state.get("_rl_using_sid_fallback"):
-            st.session_state["_rl_using_sid_fallback"] = True
-            _log("Rate limiting: IP indisponibil, folosim session_id ca identificator.", "silent")
-    # Hash SHA-256 — nu stocăm niciodată IP-uri în clar
-    return hashlib.sha256(raw_id.encode()).hexdigest()[:32]
+    # ── PDF mare: text extras local (pypdf) ──
+    if fname.endswith(".pdf"):
+        txt = _extract_pdf_text_pypdf(raw_bytes, MAX_TEXT_CHARS)
+        return txt or ("⚠️ PDF-ul nu conține text care poate fi extras (pare scanat). "
+                       f"Micșorează-l sub {_pdf_text_threshold_bytes() // (1024 * 1024)} MB ca să fie citit ca imagine.")
 
-
-def _rl_check_and_increment(identifier: str) -> tuple[bool, int, int]:
-    """
-    Verifică dacă identificatorul a depășit limita și incrementează contorul.
-
-    Returnează: (is_blocked, requests_in_window, seconds_until_reset)
-      - is_blocked=True  → cererea trebuie respinsă
-      - is_blocked=False → cererea e permisă
-    """
-    max_req, window, block_sec = _get_rl_config()
-    now = time.time()
-
-    # ── Nivel 1: session_state (instant, fără Supabase) ──
-    # Folosit ca cache local pentru a nu lovi Supabase la fiecare mesaj.
-    _sl_key     = f"_rl_{identifier}"
-    _sl_blocked = f"_rl_blocked_{identifier}"
-
-    blocked_until = st.session_state.get(_sl_blocked, 0)
-    if blocked_until > now:
-        return True, max_req, int(blocked_until - now)
-
-    sl_data = st.session_state.get(_sl_key, {"window_start": now, "count": 0})
-    # Dacă fereastra s-a scurs, resetăm
-    if now - sl_data["window_start"] > window:
-        sl_data = {"window_start": now, "count": 0}
-
-    sl_data["count"] += 1
-    st.session_state[_sl_key] = sl_data
-
-    if sl_data["count"] > max_req:
-        until = now + block_sec
-        st.session_state[_sl_blocked] = until
-        # Scriem blocajul și în Supabase (async-like — nu blocăm UI)
-        _rl_write_to_db(identifier, sl_data["window_start"], sl_data["count"], until)
-        return True, sl_data["count"], block_sec
-
-    # ── Nivel 2: Supabase (persistent, cross-restart) — o dată la 5 cereri ──
-    # Nu scriem la Supabase la FIECARE mesaj — e prea lent. Scriem la fiecare 5.
-    if sl_data["count"] % 5 == 0:
-        _rl_write_to_db(identifier, sl_data["window_start"], sl_data["count"], None)
-
-    secs_left = int(window - (now - sl_data["window_start"]))
-    return False, sl_data["count"], max(secs_left, 0)
-
-
-def _rl_write_to_db(identifier: str, window_start: float,
-                    count: int, blocked_until: float | None) -> None:
-    """Scrie/actualizează starea rate limiting în Supabase. Silent la eroare."""
-    if not is_supabase_available():
-        return
-    try:
-        client = get_supabase_client()
-        if not client:
-            return
-        record = {
-            "identifier":    identifier,
-            "window_start":  window_start,
-            "request_count": count,
-            "blocked_until": blocked_until,
-        }
-        client.table("rate_limits").upsert(record).execute()
-    except Exception as e:
-        _log(f"RL DB write error (non-critic): {e}", "silent")
-
-
-def _rl_restore_from_db(identifier: str) -> None:
-    """
-    La prima cerere după restart, restaurează starea din Supabase în session_state.
-    Apelat o singură dată per sesiune (flagul _rl_restored_<id>).
-    """
-    if st.session_state.get(f"_rl_restored_{identifier}"):
-        return
-    st.session_state[f"_rl_restored_{identifier}"] = True
-    if not is_supabase_available():
-        return
-    try:
-        client = get_supabase_client()
-        if not client:
-            return
-        resp = client.table("rate_limits").select(
-            "window_start, request_count, blocked_until"
-        ).eq("identifier", identifier).execute()
-        if not resp.data:
-            return
-        row = resp.data[0]
-        now = time.time()
-        _, window, _ = _get_rl_config()
-        # Ignorăm date mai vechi decât o fereastră — nu mai sunt relevante
-        if now - (row.get("window_start") or 0) > window:
-            return
-        # Restaurăm în session_state
-        st.session_state[f"_rl_{identifier}"] = {
-            "window_start": row["window_start"],
-            "count":        row["request_count"],
-        }
-        bu = row.get("blocked_until")
-        if bu and bu > now:
-            st.session_state[f"_rl_blocked_{identifier}"] = bu
-    except Exception as e:
-        _log(f"RL DB restore error (non-critic): {e}", "silent")
-
-
-def check_rate_limit() -> tuple[bool, str]:
-    """
-    Punct central de verificare rate limiting — apelat înainte de fiecare cerere AI.
-
-    Returnează: (is_allowed, mesaj_eroare_sau_gol)
-      - (True, "")          → cererea e permisă
-      - (False, "mesaj...")  → cererea e blocată, afișează mesajul
-    """
-    identifier = _get_client_identifier()
-    # Restaurăm din DB la prima cerere din această sesiune
-    _rl_restore_from_db(identifier)
-    blocked, count, secs = _rl_check_and_increment(identifier)
-    if blocked:
-        max_req, _, _ = _get_rl_config()
-        if secs > 60:
-            wait_str = f"{secs // 60} minute și {secs % 60} secunde"
-        else:
-            wait_str = f"{secs} secunde"
-        return False, (
-            f"⛔ Prea multe cereri ({count} în ultimul minut). "
-            f"Te rugăm să aștepți **{wait_str}** înainte de a trimite alt mesaj. "
-            f"Limita este de {max_req} cereri/minut pentru a asigura accesul tuturor elevilor."
-        )
-    return True, ""
-
-
-
-# ── Remember-me token: HMAC semnat local, fără query Supabase la validare ──
-# Format token: base64url(user_id + ":" + expires_ts + ":" + hmac_sha256)
-# Avantaj: validare instantă la fiecare rerun, zero latență Supabase, infailibilă.
-_REMEMBER_TOKEN_DAYS = 90
-
-def _get_token_secret() -> str:
-    """
-    Citește secretul HMAC — TREBUIE să fie același la creare și validare.
-    Prioritate: TOKEN_SECRET > SUPABASE_KEY > SUPABASE_URL (ultimele două există garantat).
-    NU folosiți 'fallback-secret-key' hardcodat — ar fi același pentru toți utilizatorii.
-
-    FIX SECURITATE: Nu mai există fallback hardcodat. Dacă secretele nu sunt configurate,
-    ridicăm o eroare explicită în loc să folosim o valoare predictibilă care ar permite
-    oricui să falsifice un remember-me token valid.
-    """
-    try:
-        s = st.secrets
-        for key in ("TOKEN_SECRET", "SUPABASE_KEY", "supabase_key", "SUPABASE_URL", "supabase_url"):
-            val = s.get(key, "")
-            if val and len(str(val)) >= 8:
-                return str(val)
-        # Încearcă APP_INSTANCE_ID ca ultimă resursă (dar trebuie să aibă cel puțin 8 caractere)
-        app_id = s.get("APP_INSTANCE_ID", "")
-        if app_id and len(str(app_id)) >= 8:
-            return str(app_id)
-    except Exception:
-        pass
-    # Niciun secret valid găsit — ridicăm eroare explicită, NU folosim fallback hardcodat.
-    # Un secret hardcodat permite oricui să creeze remember-me tokens valide.
-    raise RuntimeError(
-        "CONFIGURARE LIPSĂ: Nu există niciun secret valid pentru semnarea token-urilor HMAC. "
-        "Adaugă cel puțin unul din: TOKEN_SECRET, SUPABASE_KEY sau SUPABASE_URL în secrets.toml."
-    )
-
-
-def _create_remember_token(user_id: str) -> str:
-    """
-    Creează un token HMAC semnat local. Nu necesită Supabase.
-    Format: <user_id>.<expires>.<hmac>  — toate componentele în base64url.
-    Returnează string gol dacă secretele nu sunt configurate.
-    """
-    try:
-        expires = int(time.time()) + _REMEMBER_TOKEN_DAYS * 86400
-        payload = f"{user_id}:{expires}"
-        secret  = _get_token_secret().encode()
-        sig     = _hmac_module.new(secret, payload.encode(), hashlib.sha256).hexdigest()
-        raw     = f"{payload}:{sig}"
-        return _b64_module.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-    except RuntimeError as e:
-        _log(f"Token HMAC nu poate fi creat: {e}", "warning")
-        return ""
-
-
-def _validate_remember_token(token: str) -> dict | None:
-    """
-    Validează un token HMAC local — fără query Supabase, instant.
-    Dacă e valid și neexpirat, încarcă datele utilizatorului din Supabase (o singură dată).
-    Returnează None dacă secretele nu sunt configurate sau tokenul e invalid.
-    """
-    if not token or len(token) < 20:
-        return None
-    try:
-        # Decodăm
-        padding = "=" * (4 - len(token) % 4) if len(token) % 4 else ""
-        raw = _b64_module.urlsafe_b64decode(token + padding).decode()
-        parts = raw.split(":")
-        if len(parts) != 3:
-            return None
-        user_id, expires_str, sig = parts
-
-        # Verificăm semnătura HMAC
-        payload = f"{user_id}:{expires_str}"
+    # ── .txt și .srt: decodare UTF-8 cu fallback latin-1 ──
+    if fname.endswith(".txt") or fname.endswith(".srt") or "text/plain" in ftype or "srt" in ftype:
         try:
-            secret = _get_token_secret().encode()
-        except RuntimeError:
-            return None  # Secretele nu sunt configurate — nu putem valida
-        expected = _hmac_module.new(secret, payload.encode(), hashlib.sha256).hexdigest()
-        if not _hmac_module.compare_digest(sig, expected):
-            return None
+            text = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            try:
+                text = raw_bytes.decode("latin-1")
+            except Exception:
+                return None
 
-        # Verificăm expirarea
-        if int(expires_str) < int(time.time()):
-            return None
+        if len(text) <= MAX_TEXT_CHARS:
+            return text  # fișier mic — returnăm integral
 
-        # Token valid — încărcăm datele utilizatorului din Supabase
-        # Aceasta e singura interogare DB, se face doar când session_state e gol
-        client = get_supabase_client()
-        if not client:
-            return None
-        resp = client.table("users").select(
-            "id, email, role, display_name, clasa, materii_preferate, "
-            "filiera, profil_liceu, specializare"
-        ).eq("id", user_id).execute()
+        # Fișier mare: pentru .srt tăiem la un bloc complet (nu la mijlocul unui dialog)
+        if fname.endswith(".srt"):
+            truncated = text[:MAX_TEXT_CHARS]
+            last_blank = truncated.rfind("\n\n")
+            if last_blank > 0:
+                truncated = truncated[:last_blank]
+            total_subs = text.count("\n\n") + 1
+            kept_subs  = truncated.count("\n\n") + 1
+            truncated += (
+                f"\n\n[AVERTISMENT: subtitrarea a fost trunchiata la {kept_subs} din {total_subs} replici "
+                f"({len(truncated):,} din {len(text):,} caractere). "
+                f"Daca ai nevoie de tot fisierul, imparte-l in bucati si traduce pe rand.]"
+            )
+            return truncated
 
-        if not resp.data:
-            return None
-        return resp.data[0]
+        return text[:MAX_TEXT_CHARS]
+
+    # ── .docx: python-docx ──
+    if fname.endswith(".docx") or "wordprocessingml" in ftype:
+        if not _DOCX_AVAILABLE:
+            return (
+                "⚠️ Biblioteca python-docx nu este instalată. "
+                "Adaugă 'python-docx' în requirements.txt pentru suport .docx."
+            )
+        try:
+            import io
+            doc = _DocxDocument(io.BytesIO(raw_bytes))
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            # Includem și tabelele din document
+            for table in doc.tables:
+                for row in table.rows:
+                    row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
+                    if row_text:
+                        paragraphs.append(row_text)
+            text = "\n".join(paragraphs)
+            return text[:MAX_TEXT_CHARS]
+        except Exception as e:
+            return f"⚠️ Nu s-a putut citi fișierul .docx: {e}"
+
+    # ── .doc (format vechi Word — binar) ──
+    # Extragerea "text brut" din binar pierdea diacriticele și amesteca nume de fonturi/stiluri
+    # în text, deci modelul primea gunoi. Mai bine un mesaj clar decât un răspuns greșit.
+    if fname.endswith(".doc") or ftype == "application/msword":
+        return (
+            "⚠️ Fișierele **.doc** (Word vechi) nu pot fi citite corect — diacriticele se pierd. "
+            "Deschide documentul în Word sau LibreOffice, salvează-l ca **.docx** și încarcă-l din nou."
+        )
+
+    # ── .dbf: dbfread ──
+    if fname.endswith(".dbf") or "dbf" in ftype or "dbase" in ftype:
+        if not _DBF_AVAILABLE:
+            return (
+                "⚠️ Biblioteca dbfread nu este instalată. "
+                "Adaugă 'dbfread' în requirements.txt pentru suport .dbf."
+            )
+        try:
+            import io as _io
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".dbf") as tmp:
+                    tmp.write(raw_bytes)
+                    tmp_path = tmp.name
+                table = _DBF(tmp_path, encoding="utf-8", ignore_missing_memofile=True)
+                headers = table.field_names
+                rows = []
+                rows.append(" | ".join(headers))
+                rows.append("-" * min(80, len(" | ".join(headers)) + 4))
+                for i, record in enumerate(table):
+                    if i >= 500:  # limităm la 500 rânduri pentru context
+                        rows.append(f"... (și încă {len(list(table)) - 500} rânduri)")
+                        break
+                    rows.append(" | ".join(str(record.get(h, "")) for h in headers))
+                text = "\n".join(rows)
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    os.unlink(tmp_path)
+            return text[:MAX_TEXT_CHARS]
+        except Exception as e:
+            # Fallback: encoding cp1250 (frecvent în fișierele .dbf românești)
+            try:
+                tmp_path2 = None
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".dbf") as tmp2:
+                    tmp2.write(raw_bytes)
+                    tmp_path2 = tmp2.name
+                table2 = _DBF(tmp_path2, encoding="cp1250", ignore_missing_memofile=True)
+                headers2 = table2.field_names
+                rows2 = [" | ".join(headers2)]
+                for i, record in enumerate(table2):
+                    if i >= 500:
+                        break
+                    rows2.append(" | ".join(str(record.get(h, "")) for h in headers2))
+                text2 = "\n".join(rows2)
+                if tmp_path2 and os.path.exists(tmp_path2):
+                    os.unlink(tmp_path2)
+                return text2[:MAX_TEXT_CHARS]
+            except Exception as e2:
+                return f"⚠️ Nu s-a putut citi fișierul .dbf: {e2}"
+
+    return None  # tip necunoscut
+
+
+# PDF-urile mai mari de atât nu mai sunt trimise ca fișier la AI: le extragem textul local cu pypdf
+# (licență BSD — înlocuiește PyMuPDF, care e AGPL). Configurabil din secrets: PDF_TEXT_OVER_MB.
+def _pdf_text_threshold_bytes() -> int:
+    try:
+        return int(float(st.secrets.get("PDF_TEXT_OVER_MB", 20)) * 1024 * 1024)
+    except Exception:
+        return 20 * 1024 * 1024
+
+
+def _is_large_pdf(uploaded_file) -> bool:
+    return (uploaded_file.name.lower().endswith(".pdf")
+            and (uploaded_file.size or 0) > _pdf_text_threshold_bytes())
+
+
+def _extract_pdf_text_pypdf(pdf_bytes: bytes, max_chars: int = 400_000) -> str | None:
+    """Textul unui PDF, pagină cu pagină (pypdf). None dacă PDF-ul nu are text (ex. scanat)."""
+    try:
+        import io
+        from pypdf import PdfReader
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        parts, total = [], 0
+        for i, page in enumerate(reader.pages, 1):
+            t = (page.extract_text() or "").strip()
+            if t:
+                parts.append(f"--- Pagina {i} ---\n{t}")
+                total += len(t)
+                if total >= max_chars:
+                    parts.append("[... document trunchiat — prea lung ...]")
+                    break
+        text = "\n\n".join(parts)
+        return text[:max_chars] if text.strip() else None
     except Exception as e:
-        _log(f"Eroare validare token: {e}", "silent")
+        _log("Extragere text PDF (pypdf) eșuată", "silent", e)
         return None
 
 
-def _delete_remember_token(token: str) -> None:
-    """Compatibilitate — token-ul HMAC nu e stocat în DB, nimic de șters."""
-    pass
-
-
-def _delete_all_user_tokens(user_id: str) -> None:
-    """Compatibilitate — token-ul HMAC nu e stocat în DB, nimic de șters."""
-    pass
-
-def _hash_password(password: str) -> str:
-    """Bcrypt hashing — salt generat automat de bcrypt, stocat in hash."""
-    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=12))
-    return hashed.decode("utf-8")
-
-def _verify_password(password: str, stored_hash: str) -> bool:
-    """Verifica parola fata de hash-ul bcrypt stocat.
-    Suporta si hash-urile vechi (salt:sha256) pentru migrare transparenta.
-    """
-    try:
-        # Hash bcrypt nou — incepe cu $2b$ sau $2a$
-        if stored_hash.startswith("$2"):
-            return bcrypt.checkpw(password.encode("utf-8"), stored_hash.encode("utf-8"))
-        # Hash vechi (salt:sha256) — migrare transparenta la bcrypt
-        import hashlib as _hl
-        salt, h = stored_hash.split(":", 1)
-        return _hl.sha256((salt + password).encode()).hexdigest() == h
-    except Exception:
+def _is_text_file(uploaded_file) -> bool:
+    """Returnează True dacă fișierul trebuie procesat ca text (nu trimis la Google Files API)."""
+    if not uploaded_file:
         return False
-
-def auth_register(email: str, password: str, display_name: str = "") -> tuple[bool, str]:
-    """
-    Înregistrează un utilizator nou.
-    Returnează (success, mesaj_eroare_sau_user_id).
-    """
-    email = email.strip().lower()
-    if not _EMAIL_RE.match(email):
-        return False, "Adresa de email nu este validă."
-    if len(password) < 6:
-        return False, "Parola trebuie să aibă cel puțin 6 caractere."
-
-    client = get_supabase_client()
-    if not client:
-        return False, "Baza de date nu este disponibilă. Încearcă mai târziu."
-    try:
-        # Verifică dacă emailul există deja
-        existing = client.table("users").select("id").eq("email", email).execute()
-        if existing.data:
-            return False, "Există deja un cont cu această adresă de email."
-
-        user_id = str(uuid.uuid4())
-        now = time.time()
-        client.table("users").insert({
-            "id": user_id,
-            "email": email,
-            "password_hash": _hash_password(password),
-            "role": "student",
-            "display_name": display_name.strip() or email.split("@")[0],
-            "created_at": now,
-            "last_login": now,
-        }).execute()
-        return True, user_id
-    except Exception as e:
-        _log("Eroare la înregistrare", "silent", e)
-        return False, "Eroare la crearea contului. Încearcă mai târziu."
-
-
-def auth_login(email: str, password: str) -> tuple[bool, str, dict | None]:
-    """
-    Autentifică un utilizator.
-    Returnează (success, mesaj, user_dict).
-    user_dict include 'remember_token' — token persistent pentru 'Rămâi logat'.
-    Include rate limiting: blocaj temporar după 5 încercări eșuate consecutive.
-    """
-    # ── Rate limiting: max 5 încercări eșuate per sesiune de browser ──
-    _fail_key  = "_login_failures"
-    _block_key = "_login_blocked_until"
-    _blocked_until = st.session_state.get(_block_key, 0)
-    if time.time() < _blocked_until:
-        wait_sec = int(_blocked_until - time.time())
-        return False, f"Prea multe încercări eșuate. Mai încearcă în {wait_sec} secunde.", None
-
-    email = email.strip().lower()
-    client = get_supabase_client()
-    if not client:
-        return False, "Baza de date nu este disponibilă.", None
-    try:
-        resp = client.table("users").select(
-            "id, email, password_hash, role, display_name, clasa, materii_preferate, "
-            "filiera, profil_liceu, specializare"
-        ).eq("email", email).execute()
-
-        if not resp.data:
-            # Incrementăm contorul de eșecuri
-            failures = st.session_state.get(_fail_key, 0) + 1
-            st.session_state[_fail_key] = failures
-            if failures >= 5:
-                st.session_state[_block_key] = time.time() + 60  # 60s blocaj
-                st.session_state[_fail_key]  = 0
-            return False, "Email sau parolă incorectă.", None
-
-        user = resp.data[0]
-        if not _verify_password(password, user["password_hash"]):
-            failures = st.session_state.get(_fail_key, 0) + 1
-            st.session_state[_fail_key] = failures
-            if failures >= 5:
-                st.session_state[_block_key] = time.time() + 60
-                st.session_state[_fail_key]  = 0
-            return False, "Email sau parolă incorectă.", None
-
-        # Login reușit — resetăm contorul de eșecuri
-        st.session_state[_fail_key]  = 0
-        st.session_state.pop(_block_key, None)
-
-        # Actualizează last_login
-        client.table("users").update({"last_login": time.time()}).eq("id", user["id"]).execute()
-
-        user_clean = {k: v for k, v in user.items() if k != "password_hash"}
-
-        # Creează remember token pentru "Rămâi logat"
-        token = _create_remember_token(user_clean["id"])
-        user_clean["remember_token"] = token or ""
-
-        return True, "Autentificat cu succes!", user_clean
-    except Exception as e:
-        _log("Eroare la login", "silent", e)
-        return False, "Eroare la autentificare. Încearcă mai târziu.", None
-
-
-def auth_transfer_sessions(anon_session_ids: list[str], user_id: str):
-    """
-    Transferă sesiunile anonime la contul utilizatorului după login.
-    Actualizează user_id în tabelele sessions și history.
-    """
-    if not anon_session_ids:
-        return
-    client = get_supabase_client()
-    if not client:
-        return
-    try:
-        for sid in anon_session_ids:
-            if not is_valid_session_id(sid):
-                continue
-            client.table("sessions").update({"user_id": user_id}).eq("session_id", sid).execute()
-            client.table("history").update({"user_id": user_id}).eq("session_id", sid).execute()
-    except Exception as e:
-        _log("Eroare la transferul sesiunilor", "silent", e)
-
-
-def auth_get_user_sessions(user_id: str, limit: int = 20) -> list[dict]:
-    """Returnează sesiunile unui utilizator autentificat."""
-    client = get_supabase_client()
-    if not client:
-        return []
-    try:
-        resp = (
-            client.table("session_previews")
-            .select("session_id, last_active, msg_count, preview")
-            .eq("user_id", user_id)
-            .eq("app_id", get_app_id())
-            .gt("msg_count", 0)
-            .order("last_active", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return resp.data or []
-    except Exception:
-        return []
-
-
-def auth_update_profile(user_id: str, display_name: str, clasa: str, materii: list[str],
-                        filiera: str = "", profil_liceu: str = "", specializare: str = "") -> bool:
-    """Actualizează profilul utilizatorului."""
-    client = get_supabase_client()
-    if not client:
-        return False
-    try:
-        update_data = {
-            "display_name":  (display_name or "").strip(),
-            "clasa":         (clasa or "").strip(),
-            "filiera":       (filiera or "").strip(),
-            "profil_liceu":  (profil_liceu or "").strip(),
-            "specializare":  (specializare or "").strip(),
-        }
-        # FIX Bug 1: salvează întotdeauna materii_preferate, chiar dacă lista e goală []
-        # (înainte: `if materii is not None` omitea câmpul la listă goală, lăsând valorile vechi în DB)
-        update_data["materii_preferate"] = list(materii) if materii is not None else []
-
-        resp = client.table("users").update(update_data).eq("id", user_id).execute()
-        if resp.data is not None:
-            st.session_state.pop("_profile_last_error", None)
-            return True
-        return False
-    except Exception as e:
-        _log(f"Eroare la actualizarea profilului: {e}", "warning", e)
-        st.session_state["_profile_last_error"] = str(e)
-        # Fallback: dacă eroarea e legată de tipul array al materii_preferate (Supabase uneori
-        # refuză array-uri dacă coloana nu e declarată ca text[]), reîncercăm FĂRĂ materii_preferate
-        # pentru a salva cel puțin celelalte câmpuri (nume, clasă, profil).
-        try:
-            client.table("users").update({
-                "display_name":  (display_name or "").strip(),
-                "clasa":         (clasa or "").strip(),
-                "filiera":       (filiera or "").strip(),
-                "profil_liceu":  (profil_liceu or "").strip(),
-                "specializare":  (specializare or "").strip(),
-            }).eq("id", user_id).execute()
-            st.session_state.pop("_profile_last_error", None)
-            return True
-        except Exception as e2:
-            _log(f"Eroare fallback profil: {e2}", "silent", e2)
-            st.session_state["_profile_last_error"] = str(e2)
-            return False
-
-
-def auth_is_logged_in() -> bool:
-    return bool(st.session_state.get("auth_user_id"))
-
-
-def auth_is_admin() -> bool:
-    return st.session_state.get("auth_role") == "admin"
-
-
-def auth_logout():
-    """Delogare — curăță session_state, șterge token din URL și din localStorage."""
-    _token = st.session_state.get("_remember_token", "") or st.query_params.get("rmt", "")
-    if _token:
-        _delete_remember_token(_token)
-
-    # Scoate ?rmt= din URL imediat
-    try:
-        _p = dict(st.query_params)
-        _p.pop("rmt", None)
-        st.query_params.update(_p)
-    except Exception:
-        pass
-
-    # Șterge rmt din localStorage — altfel JS-ul l-ar repune în URL la next load
-    components.html(
-        "<script>localStorage.removeItem('profesor_rmt');</script>",
-        height=0
-    )
-
-    for k in ["auth_user_id", "auth_email", "auth_display_name",
-              "auth_role", "auth_clasa", "auth_materii",
-              "auth_filiera", "auth_profil_liceu", "auth_specializare",
-              "_remember_token"]:
-        st.session_state.pop(k, None)
-    st.session_state.pop("_auth_tab", None)
-
-
-def auth_set_session(user: dict):
-    """Setează datele de autentificare în session_state după login sau restaurare token.
-    Scrie remember token direct în ?rmt= URL param — citit sincron la fiecare run de Python.
-    """
-    st.session_state["auth_user_id"]       = user["id"]
-    st.session_state["auth_email"]         = user["email"]
-    st.session_state["auth_display_name"]  = user.get("display_name", user["email"].split("@")[0])
-    st.session_state["auth_role"]          = user.get("role", "student")
-    st.session_state["auth_clasa"]         = user.get("clasa", "")
-    st.session_state["auth_filiera"]       = user.get("filiera", "")
-    st.session_state["auth_profil_liceu"]  = user.get("profil_liceu", "")
-    st.session_state["auth_specializare"]  = user.get("specializare", "")
-    # Salvează remember token în session_state și în URL (persistent între reruns)
-    # Scriem în URL DOAR dacă nu e deja acolo — altfel declanșăm rerun infinit
-    token = user.get("remember_token", "")
-    if token:
-        st.session_state["_remember_token"] = token
-        try:
-            if st.query_params.get("rmt", "") != token:
-                st.query_params["rmt"] = token
-        except Exception:
-            pass
-
-    # Curăță materiile incompatibile cu profilul chiar la login,
-    # înainte ca datele să ajungă în session_state.
-    # Ex: dacă în DB sunt salvate atât Fizică Real cât și Fizică Tehnologic
-    # (din sesiuni anterioare unui profil incomplet), eliminăm cea greșită.
-    _filiera = user.get("filiera", "") or ""
-    _materii_raw = user.get("materii_preferate") or []
-    if _filiera:
-        _este_tehn = "tehnolog" in _filiera.lower()
-        _de_exclus = {"⚡ Fizică Tehnologic"} if not _este_tehn else {"⚡ Fizică Real"}
-        _materii_raw = [m for m in _materii_raw if m not in _de_exclus]
-    st.session_state["auth_materii"] = _materii_raw
-
-
-def get_student_profile_context() -> str:
-    """
-    Construiește un bloc de context despre profilul elevului pentru system prompt.
-    Returneaza string gol dacă elevul nu e autentificat sau nu are profil complet.
-    """
-    if not auth_is_logged_in():
-        return ""
-
-    display   = st.session_state.get("auth_display_name", "")
-    clasa     = st.session_state.get("auth_clasa", "")
-    filiera   = st.session_state.get("auth_filiera", "")
-    profil    = st.session_state.get("auth_profil_liceu", "")
-    spec      = st.session_state.get("auth_specializare", "")
-    materii   = st.session_state.get("auth_materii") or []
-
-    # Dacă nu are niciun date de profil, nu injectăm nimic
-    if not any([clasa, filiera, profil, spec, materii]):
-        return ""
-
-    lines = ["\n\n═══════════════════════════════════════════════════"]
-    lines.append("PROFILUL ELEVULUI (informații pentru personalizare)")
-    lines.append("═══════════════════════════════════════════════════")
-
-    if display:
-        lines.append(f"Nume: {display}")
-    if clasa:
-        lines.append(f"Clasa: {clasa}")
-    if filiera:
-        lines.append(f"Filiera: {filiera}")
-    if profil:
-        lines.append(f"Profil liceu: {profil}")
-    if spec:
-        lines.append(f"Specializare: {spec}")
-
-    # Materii relevante din programa specializării
-    # PROFILE_BAC poate să nu fie definit încă la primul apel (SYSTEM_PROMPT inițial)
-    # — folosim globals() pentru acces safe
-    _profile_bac = globals().get("PROFILE_BAC", {})
-    if _profile_bac and filiera and profil and spec:
-        spec_data = _profile_bac.get(filiera, {}).get(profil, {}).get(spec, {})
-        if spec_data:
-            obl = spec_data.get("materii_obligatorii", [])
-            opt = spec_data.get("materii_optionale", [])
-            if obl:
-                lines.append(f"Materii obligatorii BAC: {', '.join(obl)}")
-            if opt:
-                lines.append(f"Materii opționale BAC: {', '.join(opt)}")
-
-    if materii:
-        lines.append(f"Materii preferate/studiate: {', '.join(materii)}")
-
-    lines.append("\nFOLOSEȘTE aceste informații pentru a:")
-    lines.append("- Adapta explicațiile la nivelul și programa clasei elevului")
-    lines.append("- Prioritiza materii relevante pentru profilul lui la BAC")
-    lines.append("- Menționa conexiuni între materii din programa specializării")
-    lines.append("- Nu întreba elevul ce clasă e sau ce profil are — știi deja")
-    lines.append("═══════════════════════════════════════════════════")
-
-    return "\n".join(lines)
-
-
-def render_auth_sidebar():
-    """
-    Randează blocul de autentificare în sidebar.
-    Dacă utilizatorul e autentificat: afișează profil + logout.
-    Dacă nu: afișează formularele de login/register.
-    """
-    if auth_is_logged_in():
-        # ── Utilizator autentificat ──
-        display = st.session_state.get("auth_display_name", "Elev")
-        role    = st.session_state.get("auth_role", "student")
-        clasa   = st.session_state.get("auth_clasa", "")
-        icon    = "👑" if role == "admin" else "👤"
-
-        _spec_display   = st.session_state.get("auth_specializare", "")
-        _filiera_display = st.session_state.get("auth_filiera", "")
-
-        _profil_line = ""
-        if _spec_display:
-            _profil_line = f"<br><span style='font-size:11px;opacity:0.7'>📚 {_spec_display}</span>"
-        elif _filiera_display:
-            _profil_line = f"<br><span style='font-size:11px;opacity:0.7'>🏫 {_filiera_display}</span>"
-
-        st.markdown(
-            f"<div style='background:linear-gradient(135deg,#667eea22,#764ba222);"
-            f"border:1px solid #667eea44;padding:10px 14px;border-radius:10px;margin:4px 0 8px 0'>"
-            f"<b>{icon} {display}</b>"
-            + (f"<br><span style='font-size:12px;opacity:0.7'>Clasa {clasa}</span>" if clasa else "")
-            + _profil_line
-            + ("&nbsp;&nbsp;<span style='font-size:11px;background:#e74c3c22;color:#e74c3c;"
-               "border-radius:4px;padding:1px 6px'>ADMIN</span>" if role == "admin" else "")
-            + "</div>",
-            unsafe_allow_html=True
-        )
-
-        col_prof, col_out = st.columns(2)
-        with col_prof:
-            if st.button("✏️ Profil", use_container_width=True, key="auth_profile_btn"):
-                st.session_state["_show_profile_form"] = not st.session_state.get("_show_profile_form", False)
-                st.rerun()
-        with col_out:
-            if st.button("🚪 Delogare", use_container_width=True, key="auth_logout_btn"):
-                auth_logout()
-                st.rerun()
-
-        # ── Formular profil ──
-        if st.session_state.get("_show_profile_form"):
-            st.caption("✏️ Actualizează profilul")
-
-            # ── Selectoare IERARHICE în afara formularului (ca să fie dinamice) ──
-            st.caption("🏫 Profilul liceului tău")
-
-            _filiere = [""] + list(PROFILE_BAC.keys())
-            _fil_saved = st.session_state.get("auth_filiera", "")
-            _fil_idx = _filiere.index(_fil_saved) if _fil_saved in _filiere else 0
-            sel_filiera = st.selectbox(
-                "Filieră:",
-                options=_filiere,
-                index=_fil_idx,
-                format_func=lambda x: x if x else "— Alege filiera —",
-                key="pf_filiera_dyn"
-            )
-            # Dacă s-a schimbat filiera, resetăm profil și specializare
-            if sel_filiera != st.session_state.get("_pf_filiera_last", _fil_saved):
-                st.session_state["_pf_filiera_last"] = sel_filiera
-                st.session_state.pop("pf_profil_dyn", None)
-                st.session_state.pop("pf_spec_dyn", None)
-                st.rerun()
-
-            _profiluri = [""]
-            if sel_filiera and sel_filiera in PROFILE_BAC:
-                _profiluri += list(PROFILE_BAC[sel_filiera].keys())
-            _prof_saved = st.session_state.get("auth_profil_liceu", "")
-            _prof_saved = _prof_saved if _prof_saved in _profiluri else ""
-            _prof_idx = _profiluri.index(_prof_saved) if _prof_saved in _profiluri else 0
-            sel_profil = st.selectbox(
-                "Profil:",
-                options=_profiluri,
-                index=_prof_idx,
-                format_func=lambda x: x if x else "— Alege profilul —",
-                key="pf_profil_dyn"
-            )
-            # Dacă s-a schimbat profilul, resetăm specializarea
-            if sel_profil != st.session_state.get("_pf_profil_last", _prof_saved):
-                st.session_state["_pf_profil_last"] = sel_profil
-                st.session_state.pop("pf_spec_dyn", None)
-                st.rerun()
-
-            _specializari = [""]
-            if sel_filiera and sel_profil and sel_filiera in PROFILE_BAC:
-                _specializari += list(PROFILE_BAC[sel_filiera].get(sel_profil, {}).keys())
-            _spec_saved = st.session_state.get("auth_specializare", "")
-            _spec_saved = _spec_saved if _spec_saved in _specializari else ""
-            _spec_idx = _specializari.index(_spec_saved) if _spec_saved in _specializari else 0
-            sel_spec = st.selectbox(
-                "Specializare:",
-                options=_specializari,
-                index=_spec_idx,
-                format_func=lambda x: x if x else "— Alege specializarea —",
-                key="pf_spec_dyn"
-            )
-
-            # ── Preview materii din programă ──
-            if sel_filiera and sel_profil and sel_spec:
-                spec_data = PROFILE_BAC.get(sel_filiera, {}).get(sel_profil, {}).get(sel_spec, {})
-                if spec_data:
-                    _obl = spec_data.get("materii_obligatorii", [])
-                    _opt = spec_data.get("materii_optionale", [])
-                    st.caption(
-                        f"📋 **{sel_spec}**: " + ", ".join(_obl)
-                        + (" · opționale: " + ", ".join(_opt) if _opt else "")
-                    )
-
-            st.divider()
-
-            # ── Formularul pentru restul câmpurilor ──
-            with st.form("profile_form"):
-                new_name = st.text_input(
-                    "Nume afișat:",
-                    value=st.session_state.get("auth_display_name", ""),
-                    key="pf_name"
-                )
-
-                _clase_options = ["", "IX", "X", "XI", "XII"]
-                _clasa_saved = st.session_state.get("auth_clasa", "")
-                _clasa_idx = _clase_options.index(_clasa_saved) if _clasa_saved in _clase_options else 0
-                new_clasa = st.selectbox(
-                    "Clasa:",
-                    options=_clase_options,
-                    index=_clasa_idx,
-                    format_func=lambda x: f"Clasa {x}" if x else "— Alege clasa —",
-                    key="pf_clasa"
-                )
-
-                # ── Materii preferate ──
-                # Populăm automat cu materiile din programă (mapate la cheile din MATERII)
-                _auto_materii_mapped = []
-                if sel_filiera and sel_profil and sel_spec:
-                    _sd = PROFILE_BAC.get(sel_filiera, {}).get(sel_profil, {}).get(sel_spec, {})
-                    _raw = _sd.get("materii_obligatorii", []) + _sd.get("materii_optionale", [])
-                    _auto_materii_mapped = [
-                        _PROFILE_BAC_TO_MATERII[m]
-                        for m in _raw
-                        if m in _PROFILE_BAC_TO_MATERII
-                    ]
-
-                _materii_available = [m for m in list(MATERII.keys()) if m != "🤖 Automat"]
-                _current_materii = st.session_state.get("auth_materii") or []
-                # FIX Bug 1: dacă utilizatorul a salvat deja profilul (are filieră/clasă setată),
-                # folosim STRICT materiile salvate — nu mai combinăm cu auto-materii.
-                # Auto-popularea se face DOAR la cont nou, când nu există nicio selecție anterioară.
-                # Astfel, dacă utilizatorul șterge toate materiile și salvează, rămân șterse.
-                _user_has_saved_profile = bool(
-                    st.session_state.get("auth_filiera")
-                    or st.session_state.get("auth_clasa")
-                    or st.session_state.get("auth_specializare")
-                )
-                if _user_has_saved_profile:
-                    # Profil existent — respectă selecția salvată (chiar dacă e [])
-                    _default_materii = [m for m in _current_materii if m in _materii_available]
-                else:
-                    # Cont nou fără profil — populare automată din programă ca punct de start
-                    _default_materii = list(dict.fromkeys(
-                        [m for m in _auto_materii_mapped if m in _materii_available]
-                    ))
-                new_materii = st.multiselect(
-                    "Materii preferate / studiate:",
-                    options=_materii_available,
-                    default=_default_materii,
-                    key="pf_materii"
-                )
-
-                if st.form_submit_button("💾 Salvează profilul", use_container_width=True, type="primary"):
-                    ok = auth_update_profile(
-                        st.session_state["auth_user_id"],
-                        new_name, new_clasa, new_materii,
-                        sel_filiera, sel_profil, sel_spec
-                    )
-                    if ok:
-                        st.session_state["auth_display_name"] = new_name or st.session_state["auth_display_name"]
-                        st.session_state["auth_clasa"]        = new_clasa
-                        st.session_state["auth_filiera"]      = sel_filiera
-                        st.session_state["auth_profil_liceu"] = sel_profil
-                        st.session_state["auth_specializare"] = sel_spec
-                        # FIX Bug 2 (extensie): curăță din materii orice materie incompatibilă
-                        # cu noul profil (ex: Fizică Tehnologic salvată înainte de setarea
-                        # profilului teoretic). Actualizăm și în DB dacă e cazul.
-                        _este_tehnologic_nou = "tehnolog" in (sel_filiera or "").lower()
-                        _materii_de_exclus = {"⚡ Fizică Tehnologic"} if not _este_tehnologic_nou else {"⚡ Fizică Real"}
-                        _materii_curatate = [m for m in new_materii if m not in _materii_de_exclus]
-                        if _materii_curatate != new_materii:
-                            # Sunt materii incompatibile — resalvăm în DB lista curățată
-                            auth_update_profile(
-                                st.session_state["auth_user_id"],
-                                new_name, new_clasa, _materii_curatate,
-                                sel_filiera, sel_profil, sel_spec
-                            )
-                        st.session_state["auth_materii"] = _materii_curatate
-                        # Resetăm starea temporară a formularului
-                        for k in ["_pf_filiera_last", "_pf_profil_last"]:
-                            st.session_state.pop(k, None)
-                        st.session_state.pop("_show_profile_form", None)
-                        # Regenerăm system prompt cu noul profil
-                        st.session_state.pop("system_prompt", None)
-                        st.success("✅ Profil actualizat!")
-                        st.rerun()
-                    else:
-                        _last_err = st.session_state.get("_profile_last_error", "")
-                        if _last_err:
-                            st.error(f"❌ Eroare: {_last_err}")
-                        else:
-                            st.error(
-                                "❌ Eroare la salvare. Rulează SQL-ul de migrare în Supabase."
-                            )
-        return  # Nu mai afișa formularele de login
-
-    # ── Utilizator neautentificat ──
-    tab = st.session_state.get("_auth_tab", "login")
-
-    # Afișăm doar butonul care duce pe celălalt tab — butonul tab-ului activ e de prisos
-    col_l, col_r = st.columns(2)
-    with col_l:
-        if tab == "register":
-            if st.button("🔑 Autentificare", use_container_width=True, key="auth_tab_login", type="secondary"):
-                st.session_state["_auth_tab"] = "login"
-                st.rerun()
-    with col_r:
-        if tab == "login":
-            if st.button("📝 Cont nou", use_container_width=True, key="auth_tab_register", type="secondary"):
-                st.session_state["_auth_tab"] = "register"
-                st.rerun()
-
-    if tab == "login":
-        with st.form("login_form", clear_on_submit=False):
-            login_email = st.text_input("Email:", placeholder="elev@gmail.com", key="login_email")
-            login_pass  = st.text_input("Parolă:", type="password", key="login_pass")
-            if st.form_submit_button("🔑 Intră în cont", use_container_width=True, type="primary"):
-                if not login_email or not login_pass:
-                    st.error("Completează emailul și parola.")
-                else:
-                    ok, msg, user = auth_login(login_email, login_pass)
-                    if ok:
-                        auth_set_session(user)
-                        # Transferă sesiunile anonime ale acestui browser la cont
-                        anon_sids = st.session_state.get("_my_session_ids", [])
-                        if anon_sids:
-                            auth_transfer_sessions(anon_sids, user["id"])
-                        st.success(f"✅ Bun venit, {user.get('display_name', '')}!")
-                        st.rerun()
-                    else:
-                        st.error(f"❌ {msg}")
-
-    else:  # register
-        with st.form("register_form", clear_on_submit=False):
-            reg_name  = st.text_input("Nume (opțional):", placeholder="Ion Popescu", key="reg_name")
-            reg_email = st.text_input("Email:", placeholder="elev@gmail.com", key="reg_email")
-            reg_pass  = st.text_input("Parolă (min. 6 caractere):", type="password", key="reg_pass")
-            reg_pass2 = st.text_input("Confirmă parola:", type="password", key="reg_pass2")
-            if st.form_submit_button("📝 Creează cont", use_container_width=True, type="primary"):
-                if reg_pass != reg_pass2:
-                    st.error("❌ Parolele nu se potrivesc.")
-                else:
-                    ok, result = auth_register(reg_email, reg_pass, reg_name)
-                    if ok:
-                        # Login automat după înregistrare
-                        ok2, msg2, user = auth_login(reg_email, reg_pass)
-                        if ok2:
-                            auth_set_session(user)
-                            anon_sids = st.session_state.get("_my_session_ids", [])
-                            if anon_sids:
-                                auth_transfer_sessions(anon_sids, user["id"])
-                            st.success("✅ Cont creat! Bun venit!")
-                            st.rerun()
-                    else:
-                        st.error(f"❌ {result}")
-
-
-def require_auth_for_premium(feature_name: str = "această funcție") -> bool:
-    """
-    Verifică dacă utilizatorul e autentificat pentru funcții premium.
-    Dacă nu e autentificat, afișează mesaj și returnează False.
-    Returnează True dacă poate folosi funcția.
-    """
-    if auth_is_logged_in():
-        return True
-    st.info(
-        f"🔐 **{feature_name}** este disponibilă doar pentru conturile înregistrate.\n\n"
-        f"Creează un cont gratuit din sidebar (secțiunea **🔑 Cont**) pentru a avea acces.",
-        icon="🎓"
-    )
-    return False
-
-
-def render_admin_panel():
-    """Admin panel pentru profesor — statistici și management utilizatori."""
-    if not auth_is_admin():
-        return
-
-    st.subheader("👑 Admin Panel")
-
-    client = get_supabase_client()
-    if not client:
-        st.error("Baza de date nu este disponibilă.")
-        return
-
-    try:
-        with st.expander("📊 Statistici utilizatori", expanded=True):
-            users_resp = client.table("users").select(
-                "id, email, display_name, role, clasa, filiera, profil_liceu, specializare, created_at, last_login"
-            ).order("created_at", desc=True).execute()
-            users = users_resp.data or []
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total conturi", len(users))
-            col2.metric("Admini", sum(1 for u in users if u.get("role") == "admin"))
-            col3.metric("Elevi", sum(1 for u in users if u.get("role") == "student"))
-
-            st.caption(f"Ultimii {min(len(users), 50)} utilizatori înregistrați:")
-            for u in users[:50]:
-                last = format_time_ago(u.get("last_login") or u.get("created_at", 0))
-                role_badge = "👑" if u.get("role") == "admin" else "👤"
-                clasa = f"Cls {u['clasa']}" if u.get("clasa") else ""
-                spec  = u.get("specializare", "")
-                profil_str = " · ".join(filter(None, [clasa, spec]))
-                st.caption(
-                    f"{role_badge} **{u.get('display_name','?')}** ({u['email']})"
-                    + (f" — {profil_str}" if profil_str else "")
-                    + f" — activ {last}"
-                )
-
-        with st.expander("⚙️ Management roluri"):
-            st.caption("Schimbă rolul unui utilizator:")
-            target_email = st.text_input("Email utilizator:", key="admin_target_email")
-            new_role = st.selectbox("Rol nou:", options=["student", "admin"], key="admin_new_role")
-            if st.button("💾 Aplică", key="admin_apply_role"):
-                if target_email:
-                    try:
-                        res = client.table("users").update({"role": new_role}).eq("email", target_email.strip().lower()).execute()
-                        if res.data:
-                            st.success(f"✅ Rol actualizat pentru {target_email}")
-                        else:
-                            st.error("❌ Utilizatorul nu a fost găsit.")
-                    except Exception as e:
-                        st.error(f"❌ Eroare: {e}")
-
-    except Exception as e:
-        st.error(f"Eroare la încărcarea datelor: {e}")
+    fname = uploaded_file.name.lower()
+    return any(fname.endswith(f".{ext}") for ext in _TEXT_FILE_EXTENSIONS) or _is_large_pdf(uploaded_file)
 
 
 # === APP INSTANCE ID ===
@@ -1090,77 +275,36 @@ MAX_MESSAGES_TO_SEND_TO_AI = 20
 MAX_MESSAGES_IN_DB_PER_SESSION = 500
 CLEANUP_DAYS_OLD = 90  # Păstrăm istoricul 90 de zile — acoperă vacanțe, pauze lungi
 
+# === RATE LIMITING (minut + zi per sesiune + plafon global pe zi) ===
+# Streamlit Cloud nu expune IP-ul direct; session_id e unic per browser/tab, dar clientul
+# și-l poate schimba (tab nou). De aceea există și un plafon GLOBAL pe zi.
+# Limitele zilnice se aplică DOAR când folosești cheile tale din secrets (cota ta partajată);
+# un elev care folosește propria cheie personală e limitat doar pe minut.
+RATE_LIMIT_MAX_REQUESTS = 20    # cereri maxime per fereastră (per sesiune)
+RATE_LIMIT_WINDOW_SEC   = 60    # fereastra, în secunde
+RATE_LIMIT_SESSION_DAY  = 200   # cereri AI / zi / sesiune   (0 = dezactivat; override: secrets RATE_LIMIT_SESSION_DAY)
+RATE_LIMIT_GLOBAL_DAY   = 1000  # cereri AI / zi / toți elevii (0 = dezactivat; override: secrets RATE_LIMIT_GLOBAL_DAY)
+                                # ≈ cota unui proiect Google pe zi (500 + 500 + 20); înmulțește cu nr. de proiecte din secrets
+# Contoarele stau într-un @st.cache_resource (vezi _get_rate_store): o variabilă globală din
+# script ar fi recreată la FIECARE rerun și limitatorul n-ar bloca niciodată nimic.
+
 # === MODEL GEMINI — singura sursă de adevăr pentru numele modelului ===
-GEMINI_MODEL = "gemini-2.5-flash"
+# Lanț de rezervă (vezi MODEL_FALLBACKS_NO_CACHE în run_chat_with_rotation).
+# Limite free tier verificate pe dashboard (sept. 2026); cotele sunt per PROIECT Google și per model:
+#   1. gemini-3.1-flash-lite — principal            (15 RPM / 500 RPD)
+#   2. gemini-3.5-flash-lite — rezervă 1            (15 RPM / 500 RPD)
+#   3. gemini-3.8-flash      — rezervă 2, ultima    ( 5 RPM /  20 RPD)
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 SUMMARIZE_AFTER_MESSAGES = 30   # Rezumăm când depășim acest număr de mesaje
 MESSAGES_KEPT_AFTER_SUMMARY = 10  # Câte mesaje recente păstrăm după rezumare
 
 # === ISTORIC CONVERSAȚII ===
-def get_session_list(limit: int = 20) -> list[dict]:
-    """Returnează lista sesiunilor.
-    - Dacă utilizatorul e autentificat → sesiunile contului său (toate dispozitivele)
-    - Dacă nu e autentificat → sesiunile anonime ale acestui browser (_my_session_ids)
-    Cache invalidat la orice modificare.
-    """
-    cache_ts  = st.session_state.get("_sess_list_ts", 0)
-    cache_val = st.session_state.get("_sess_list_cache", None)
-    force_refresh = st.session_state.get("_sess_cache_dirty", False)
-    if force_refresh:
-        st.session_state["_sess_cache_dirty"] = False
-
-    if not force_refresh and cache_val is not None and (time.time() - cache_ts) < 5:
-        return cache_val
-
-    try:
-        supabase = get_supabase_client()
-
-        user_id = st.session_state.get("auth_user_id")
-
-        if user_id:
-            # Utilizator autentificat — toate sesiunile contului
-            resp = (
-                supabase.table("session_previews")
-                .select("session_id, last_active, msg_count, preview")
-                .eq("user_id", user_id)
-                .eq("app_id", get_app_id())
-                .gt("msg_count", 0)
-                .order("last_active", desc=True)
-                .limit(limit)
-                .execute()
-            )
-        else:
-            # Anonim — doar sesiunile cunoscute de acest browser
-            my_sids = st.session_state.get("_my_session_ids", [])
-            if not my_sids:
-                st.session_state["_sess_list_cache"] = []
-                st.session_state["_sess_list_ts"]    = time.time()
-                return []
-            resp = (
-                supabase.table("session_previews")
-                .select("session_id, last_active, msg_count, preview")
-                .in_("session_id", my_sids)
-                .eq("app_id", get_app_id())
-                .gt("msg_count", 0)
-                .order("last_active", desc=True)
-                .limit(limit)
-                .execute()
-            )
-
-        result = resp.data or []
-        st.session_state["_sess_list_cache"] = result
-        st.session_state["_sess_list_ts"]    = time.time()
-        return result
-
-    except Exception as e:
-        _log("Eroare la încărcarea sesiunilor", "silent", e)
-        return cache_val or []
-
-
 def _cleanup_gfiles() -> None:
     """Șterge toate fișierele uploadate pe Google Files API din sesiunea curentă.
     Apelat la switch sesiune, conversație nouă și explicit de utilizator.
     Fișierele expiră oricum după 48h, dar le ștergem proactiv pentru igienă.
     """
+    st.session_state.pop("_gsrc_map", None)  # octeții păstrați pentru re-upload
     gfile_keys = [k for k in st.session_state.keys() if k.startswith("_gfile_")]
     if not gfile_keys:
         return
@@ -1169,12 +313,12 @@ def _cleanup_gfiles() -> None:
         _idx  = st.session_state.get("key_index", 0)
         if not _keys:
             return
-        _client = get_gemini_client(_keys[_idx])
+        _client = genai.Client(api_key=_keys[_idx])
         for k in gfile_keys:
             gf = st.session_state.pop(k, None)
             if gf:
                 try:
-                    _client.files.delete(gf.name)
+                    _client.files.delete(name=gf.name)
                 except Exception:
                     pass  # expirat deja sau alt motiv — ignorăm
     except Exception:
@@ -1193,16 +337,16 @@ def switch_session(new_session_id: str):
     st.session_state.pop("_conversation_summary", None)
     st.session_state.pop("_summary_cached_at", None)
     st.session_state.pop("_summary_for_sid", None)
-    # FIX Bug 2: curățăm cache-ul fișierului media — fiecare sesiune începe fără fișier
-    st.session_state.pop("_media_content_cache", None)
-    st.session_state.pop("_current_uploaded_file_meta", None)
-    st.session_state.pop("_removed_file_key", None)
     # Resetăm materia detectată — fiecare sesiune începe cu autodetecție fresh.
     # Dacă sesiunea nouă are deja mesaje, materia va fi restaurată din DB la load.
     # Dacă e sesiune goală (chat nou), autodetecția pornește de la zero.
     st.session_state.pop("_detected_subject", None)
     st.session_state.pop("_pending_user_msg", None)
     st.session_state.pop("system_prompt", None)  # va fi regenerat cu materia corectă
+    # FIX: resetăm și materia selectată manual din dropdown — altfel rămâne agățată
+    # de vechea sesiune (ex: la "Conversație nouă", ecranul de selecție a materiei
+    # nu mai apărea dacă exista deja o materie selectată manual înainte).
+    st.session_state.pop("materie_selectata", None)
     # Curățăm toate cheile _mismatch_warned_* (una per sesiune anterioară)
     for _k in [k for k in st.session_state.keys() if k.startswith("_mismatch_warned_")]:
         del st.session_state[_k]
@@ -1224,6 +368,7 @@ def format_time_ago(timestamp) -> str:
     # FIX: Supabase poate returna ISO string în loc de float
     if isinstance(timestamp, str):
         try:
+            from datetime import datetime, timezone
             dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
             timestamp = dt.timestamp()
         except Exception:
@@ -1248,39 +393,56 @@ def format_time_ago(timestamp) -> str:
 
 
 # === SUPABASE CLIENT + FALLBACK ===
-@st.cache_resource(ttl=3600)  # Reîmprospătează la fiecare oră — previne token expiry
+@st.cache_resource
+def _create_supabase_client(url: str, key: str):
+    """Creează clientul (conexiunea e lazy, fără query de test).
+
+    Separat de get_supabase_client() ca eșecul să NU fie memorat: @st.cache_resource nu
+    memorează excepțiile, deci o problemă temporară nu mai blochează aplicația până la reboot.
+    """
+    return create_client(url, key)
+
+
 def get_supabase_client() -> Client | None:
-    """Returnează clientul Supabase (conexiunea e lazy, fără query de test)."""
+    """Returnează clientul Supabase sau None. Motivul eșecului ajunge în log și în
+    st.session_state["_sb_init_error"], ca să poată fi afișat (înainte eșecul era mut)."""
     try:
         url = st.secrets.get("SUPABASE_URL", "")
         key = st.secrets.get("SUPABASE_KEY", "")
         if not url or not key:
+            st.session_state["_sb_init_error"] = "SUPABASE_URL sau SUPABASE_KEY lipsesc din secrets"
             return None
-        return create_client(url, key)
-    except Exception:
+        client = _create_supabase_client(url, key)
+        st.session_state.pop("_sb_init_error", None)
+        return client
+    except Exception as e:
+        # NU includem cheia în mesaj — doar tipul și textul excepției
+        st.session_state["_sb_init_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        _log("Supabase: clientul nu a putut fi creat", "silent", e)
         return None
 
 
-@st.cache_resource(ttl=1800)
-def get_gemini_client(api_key: str) -> "genai.Client":
-    """Returneaza un client Gemini cached per cheie API.
-    Fara cache_resource, se crea un obiect nou la FIECARE click/rerun,
-    ceea ce consuma resurse si poate depasi limitele de conexiuni simultane.
-    TTL 30 min — reinnoieste periodic conexiunea pentru sanatatea clientului.
-    """
-    return genai.Client(api_key=api_key)
+SB_RETRY_INTERVAL_SEC = 30  # cât așteptăm între două încercări de reconectare
 
 
 def is_supabase_available() -> bool:
-    """Returnează statusul Supabase din cache — nu face request la fiecare apel.
-    Statusul se actualizează doar când o operație reală eșuează sau reușește."""
-    return st.session_state.get("_sb_online", True)
+    """True dacă putem încerca Supabase acum.
+
+    Online -> True. Offline -> False, dar după SB_RETRY_INTERVAL_SEC lăsăm o
+    singură operație reală să "sondeze" conexiunea (circuit breaker). Dacă
+    reușește, _mark_supabase_online() golește coada; dacă eșuează, se reia
+    așteptarea. Fără asta, un singur eșec temporar bloca sesiunea offline pe vecie.
+    """
+    if st.session_state.get("_sb_online", True):
+        return True
+    return time.time() >= st.session_state.get("_sb_retry_at", 0)
 
 
 def _mark_supabase_offline():
-    """Marchează Supabase ca offline și notifică utilizatorul."""
+    """Marchează Supabase ca offline, programează următoarea încercare și notifică utilizatorul."""
     was_online = st.session_state.get("_sb_online", True)
     st.session_state["_sb_online"] = False
+    st.session_state["_sb_retry_at"] = time.time() + SB_RETRY_INTERVAL_SEC
     if was_online:
         st.toast("⚠️ Baza de date offline — modul local activat.", icon="📴")
 
@@ -1348,7 +510,7 @@ def _flush_offline_queue():
     if successful > 0:
         st.toast(f"✅ {successful} mesaje sincronizate cu baza de date.", icon="☁️")
 
-st.set_page_config(page_title="aiProfesor Liceu", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Profesor Liceu", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
 
 # === DARK MODE ===
 # Streamlit blocheaza window.parent cross-origin, deci JS nu poate modifica pagina parinte.
@@ -1571,18 +733,288 @@ def _log(msg: str, level: str = "silent", exc: Exception = None):
             pass  # st.toast poate eșua în contexte fără sesiune activă
 
 
+# === RATE LIMITING ===
+
+@st.cache_resource
+def _get_rate_store() -> dict:
+    """Store partajat între toate sesiunile și între rerun-uri (trăiește cât procesul serverului)."""
+    return {
+        "lock": threading.Lock(),
+        "minute": defaultdict(list),     # session_id -> [timestamps] (fereastră glisantă)
+        "day": "",                       # ziua de cotă curentă
+        "session_day": defaultdict(int), # session_id -> cereri azi
+        "global_day": 0,                 # cereri azi, toate sesiunile
+    }
+
+
+def _quota_day() -> str:
+    """Ziua de cotă Gemini: RPD se resetează la miezul nopții Pacific (≈ 10:00 ora României)."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+    except Exception:
+        return (datetime.now(timezone.utc) - timedelta(hours=8)).strftime("%Y-%m-%d")
+
+
+def _owner_keys_in_use() -> bool:
+    """True dacă aplicația rulează cu cheile tale din secrets (cota partajată a tuturor elevilor)."""
+    try:
+        return ("GOOGLE_API_KEYS" in st.secrets) or ("GOOGLE_API_KEY" in st.secrets)
+    except Exception:
+        return False
+
+
+def _rl_int(name: str, default: int) -> int:
+    try:
+        return int(st.secrets.get(name, default))
+    except Exception:
+        return default
+
+
+def check_rate_limit(session_id: str, cost: int = 1, burst: bool = True) -> tuple[bool, int]:
+    """Verifică limitele: per minut (sesiune), per zi (sesiune) și per zi (global).
+
+    cost  — câte apeluri AI consumă acțiunea (ex.: poză = OCR + corectare = 2).
+    burst — dacă True, cererea contează și în fereastra de 1 minut; False = doar taxare
+            zilnică suplimentară (ex.: bucățile unei traduceri SRT).
+    Setează st.session_state["_rl_reason"] la "minute" | "session_day" | "global_day" când refuză.
+
+    Returns:
+        (allowed, remaining_in_minute)
+    """
+    store = _get_rate_store()
+    now = time.time()
+    window_start = now - RATE_LIMIT_WINDOW_SEC
+    owner = _owner_keys_in_use()
+    sess_lim = _rl_int("RATE_LIMIT_SESSION_DAY", RATE_LIMIT_SESSION_DAY) if owner else 0
+    glob_lim = _rl_int("RATE_LIMIT_GLOBAL_DAY", RATE_LIMIT_GLOBAL_DAY) if owner else 0
+    today = _quota_day()
+
+    with store["lock"]:
+        if store["day"] != today:               # zi nouă de cotă -> resetăm contoarele zilnice
+            store["day"] = today
+            store["session_day"].clear()
+            store["global_day"] = 0
+
+        hist = [t for t in store["minute"][session_id] if t > window_start]
+        store["minute"][session_id] = hist
+
+        reason = None
+        if burst and len(hist) >= RATE_LIMIT_MAX_REQUESTS:
+            reason = "minute"
+        elif sess_lim > 0 and store["session_day"][session_id] + cost > sess_lim:
+            reason = "session_day"
+        elif glob_lim > 0 and store["global_day"] + cost > glob_lim:
+            reason = "global_day"
+
+        if reason:
+            st.session_state["_rl_reason"] = reason
+            return False, 0
+
+        if burst:
+            hist.append(now)
+        if owner:
+            store["session_day"][session_id] += cost
+            store["global_day"] += cost
+
+        # Curăță sesiunile inactive (evită memory leak la multe sesiuni unice)
+        if len(store["minute"]) > 5000:
+            for k in [k for k, v in store["minute"].items() if not v or v[-1] < window_start]:
+                del store["minute"][k]
+            for k in [k for k in store["session_day"] if k not in store["minute"]]:
+                del store["session_day"][k]
+
+        remaining = RATE_LIMIT_MAX_REQUESTS - len(hist)
+
+    st.session_state["_rl_reason"] = None
+    return True, remaining
+
+
+def enforce_rate_limit(cost: int = 1, burst: bool = True) -> bool:
+    """Aplică limitele și arată mesajul potrivit. True = poți continua cu apelul AI."""
+    allowed, remaining = check_rate_limit(st.session_state.get("session_id", "anon"), cost=cost, burst=burst)
+    if allowed:
+        if burst and remaining <= 3:
+            st.toast(f"⚠️ Mai ai {remaining} cereri disponibile în acest minut.", icon="⏱️")
+        return True
+
+    reason = st.session_state.get("_rl_reason")
+    if reason == "session_day":
+        msg = (f"📅 **Ai atins limita zilnică de {_rl_int('RATE_LIMIT_SESSION_DAY', RATE_LIMIT_SESSION_DAY)} "
+               "de cereri.** Se resetează zilnic în jurul orei 10:00 (ora României).")
+    elif reason == "global_day":
+        msg = ("📅 **Serviciul gratuit a atins limita zilnică pentru toți elevii.** "
+               "Se resetează zilnic în jurul orei 10:00 (ora României). Revino atunci!")
+    else:
+        msg = (f"⏱️ **Prea multe cereri!** Ai trimis {RATE_LIMIT_MAX_REQUESTS} mesaje "
+               "în ultimul minut. Așteaptă câteva secunde și încearcă din nou.")
+    st.warning(msg, icon="🛑")
+    return False
+
+
+def _build_attachment_payload(media_content, text_file_content) -> list:
+    """Părțile de payload pentru fișierele atașate.
+
+    media_content: un Google File sau o LISTĂ de Google Files (imagini/PDF), trimise ca atare.
+    text_file_content: textul extras din fișierele text (txt/docx/dbf/srt), injectat în prompt;
+    când sunt mai multe fișiere text, fiecare are deja antetul „=== FIȘIER: nume ===”.
+    """
+    final_payload = []
+    _uf = st.session_state.get("_current_uploaded_file_meta", {}) or {}
+    _metas = _uf.get("files") or ([_uf] if _uf else [])
+    _media = (media_content if isinstance(media_content, list) else [media_content]) if media_content else []
+    _multi = len(_metas) > 1
+
+    if _media:
+        if _multi:
+            _names = ", ".join(f"'{m.get('name', '')}'" for m in _metas)
+            final_payload.append(
+                f"Elevul ți-a trimis {len(_metas)} fișiere: {_names}. Analizează-le pe TOATE "
+                "(imaginile vizual complet, documentele integral), ține cont de legăturile dintre ele "
+                "și precizează la ce fișier te referi când răspunzi."
+            )
+        elif (_uf.get("type") or "").startswith("image/"):
+            final_payload.append(
+                "Elevul ți-a trimis o imagine. Analizează-o vizual complet: "
+                "descrie ce vezi (obiecte, persoane, text, culori, forme, diagrame, exerciții scrise de mână) "
+                "și răspunde la întrebarea elevului ținând cont de tot conținutul vizual."
+            )
+        else:
+            final_payload.append(
+                f"Elevul ți-a trimis documentul '{_uf.get('name', '')}'. "
+                "Citește și analizează tot conținutul înainte de a răspunde."
+            )
+        final_payload.extend(_media)
+
+    if text_file_content:
+        if _multi:
+            final_payload.append(
+                "Conținutul fișierelor text atașate (fiecare are numele în antet):\n\n"
+                f"--- ÎNCEPUT FIȘIERE ---\n{text_file_content}\n--- SFÂRȘIT FIȘIERE ---\n\n"
+                "Analizează conținutul de mai sus și răspunde la întrebarea elevului."
+            )
+        else:
+            fname = _uf.get("name", "")
+            fname_lower = fname.lower()
+            if fname_lower.endswith(".srt"):
+                file_desc = "un fișier de subtitrare (.srt)"
+            elif fname_lower.endswith((".docx", ".doc")):
+                file_desc = "un document Word"
+            elif fname_lower.endswith(".dbf"):
+                file_desc = "o bază de date DBF"
+            elif fname_lower.endswith(".pdf"):
+                file_desc = "un document PDF (textul lui, extras pagină cu pagină)"
+            else:
+                file_desc = "un fișier text"
+            final_payload.append(
+                f"Elevul ți-a trimis {file_desc} cu numele '{fname}'. "
+                f"Conținutul complet al fișierului este:\n\n"
+                f"--- ÎNCEPUT FIȘIER ---\n{text_file_content}\n--- SFÂRȘIT FIȘIER ---\n\n"
+                f"Analizează conținutul de mai sus și răspunde la întrebarea elevului."
+            )
+    return final_payload
+
+
+def _stream_preview(text: str) -> str:
+    """Textul afișat cât timp răspunsul se generează.
+
+    Codul unui desen (marker [[DESEN_SVG]], <svg> sau <path>) nu se arată elevului ca text brut:
+    afișăm doar ce e înaintea lui + un mesaj; desenul apare randat la final.
+    """
+    cut = len(text)
+    for marker in ("[[DESEN_SVG]]", "<svg", "<path"):
+        i = text.find(marker)
+        if i != -1:
+            cut = min(cut, i)
+    if cut < len(text):
+        return text[:cut].rstrip() + "\n\n*🎨 Domnul Profesor desenează...*\n\n▌"
+    return text + "▌"
+
+
+def _salvage_partial_response(e: Exception, partial: str, placeholder, context: str = "") -> bool:
+    """Stream-ul a căzut DUPĂ ce o parte din răspuns a ajuns la elev: o păstrăm (afișată + salvată).
+
+    Returnează True dacă am păstrat răspunsul parțial (handler-ul nu mai afișează eroarea).
+    Un desen SVG rămas neterminat e tăiat; sub ~40 de caractere considerăm că nu merită păstrat.
+    """
+    partial = (partial or "").strip()
+    cut = partial.rfind("<svg")
+    if cut != -1 and "</svg>" not in partial[cut:]:
+        partial = partial[:cut].rstrip()
+    if len(partial) < 40:
+        return False
+    _log(f"[AI] răspuns întrerupt ({context}) — păstrat parțial", "silent", e)
+    placeholder.empty()
+    render_message_with_svg(partial)
+    st.session_state.messages.append({"role": "assistant", "content": partial})
+    save_message_with_limits(st.session_state.session_id, "assistant", partial)
+    st.session_state.pop("_retry_history", None)
+    st.session_state.pop("_retry_payload", None)
+    st.warning("⚠️ Răspunsul s-a întrerupt (problemă temporară cu serviciul AI). "
+               "Scrie „continuă” ca să primești restul.")
+    return True
+
+
+# === ERORI AI — mesaje prietenoase pentru elevi, detalii tehnice doar în log ===
+
+def _request_retry():
+    """Callback pentru butoanele „Reîncercați răspunsul” (vezi handler-ul _pending_retry)."""
+    st.session_state["_pending_retry"] = True
+
+
+def _show_ai_error(e: Exception, context: str = "") -> str:
+    """Loghează excepția pe server și arată un mesaj prietenos. Returnează categoria erorii."""
+    if isinstance(e, comercial.core.AccessError):
+        st.warning(str(e))
+        return "access"
+    _log(f"[AI] eroare{' (' + context + ')' if context else ''}", "silent", e)
+    low = (str(e) + " " + repr(e)).lower()
+    if "pentru azi" in low:
+        cat, msg = "quota", ("📅 Serviciul AI gratuit și-a epuizat cota pentru azi, pe toate cheile și modelele. "
+                             "Cotele se resetează în jurul orei 10:00 (ora României).")
+    elif "toate cheile" in low or "epuizat" in low or "quota" in low or re.search(r"\b429\b", low):
+        cat, msg = "quota", ("⏳ Serviciul AI gratuit a atins temporar limita de utilizare. "
+                             "Încearcă din nou peste câteva minute.")
+    elif "supraînc" in low or "overloaded" in low or re.search(r"\b503\b", low):
+        cat, msg = "overload", "🐢 Serviciul AI este aglomerat acum. Încearcă din nou în câteva secunde."
+    elif "cerere invalidă" in low or re.search(r"\b400\b", low):
+        cat, msg = "bad_request", ("⚠️ Cererea nu a putut fi procesată (mesaj prea lung sau conținut neacceptat). "
+                                   "Reformulează întrebarea sau încearcă cu un fișier mai mic.")
+    elif "access the file" in low or "files/" in low:
+        cat, msg = "file", ("📎 Fișierul atașat nu mai poate fi folosit (a expirat sau serviciul a fost schimbat). "
+                            "Elimină-l din bara laterală și încarcă-l din nou.")
+    elif "niciun text" in low:
+        cat, msg = "empty", ("🤔 Nu am primit niciun răspuns de la AI (poate a fost blocat de filtre). "
+                             "Reformulează întrebarea și încearcă din nou.")
+    elif any(x in low for x in ("timeout", "timed out", "connection", "connect", "network", "ssl")):
+        cat, msg = "network", "📡 Problemă de conexiune cu serviciul AI. Verifică internetul și încearcă din nou."
+    else:
+        cat, msg = "other", ("❌ A apărut o problemă neașteptată. Încearcă din nou; "
+                             "dacă se repetă, anunță administratorul aplicației.")
+    st.error(msg)
+    return cat
+
+
 def init_db():
     """Verifică conexiunea la Supabase. Dacă e offline, activează modul local."""
-    online = is_supabase_available()
+    # Verificăm din start că avem un client: fără el nimic nu se salvează, iar înainte nu se vedea nicăieri.
+    if get_supabase_client() is None and st.session_state.get("_sb_online", True):
+        _mark_supabase_offline()
+    online = st.session_state.get("_sb_online", True)  # starea reală, nu fereastra de reîncercare
     if not online:
+        _reason = st.session_state.get("_sb_init_error")
         st.warning("📴 **Modul offline activ** — conversația se păstrează în memorie. "
-                   "Istoricul va fi sincronizat automat când conexiunea revine.", icon="⚠️")
+                   "Istoricul va fi sincronizat automat când conexiunea revine."
+                   + (f"\n\nMotiv tehnic (pentru administrator): `{_reason}`" if _reason else ""), icon="⚠️")
 
 
 def cleanup_old_sessions(days_old: int = CLEANUP_DAYS_OLD):
-    """Șterge sesiunile vechi — rulează cel mult o dată pe zi.
-    Șterge HISTORY înainte de SESSIONS (ordinea corectă pentru integritate DB)."""
-    if time.time() - st.session_state.get("_last_cleanup", 0) < 86400:
+    """Șterge sesiunile vechi — rulează cel mult o dată la 6 ore per instanță.
+    Șterge HISTORY înainte de SESSIONS (ordinea corectă pentru integritate DB).
+    FIX 10: throttle la 6h (nu la fiecare rerun) — previne sute de query-uri Supabase/zi."""
+    _CLEANUP_INTERVAL = 6 * 3600  # 6 ore în secunde
+    if time.time() - st.session_state.get("_last_cleanup", 0) < _CLEANUP_INTERVAL:
         return
     st.session_state["_last_cleanup"] = time.time()
     try:
@@ -1605,10 +1037,6 @@ def save_message_to_db(session_id, role, content):
         "timestamp": time.time(),
         "app_id": get_app_id()
     }
-    # Atașează user_id dacă utilizatorul e autentificat
-    user_id = st.session_state.get("auth_user_id")
-    if user_id:
-        record["user_id"] = user_id
     if not is_supabase_available():
         q = _get_offline_queue()
         if len(q) < MAX_OFFLINE_QUEUE_SIZE:
@@ -1644,11 +1072,14 @@ def load_history_from_db(session_id, limit: int = MAX_MESSAGES_IN_MEMORY):
             .select("role, content, timestamp")
             .eq("session_id", session_id)
             .eq("app_id", get_app_id())
-            .order("timestamp", desc=False)
+            .neq("role", "srt_data")           # srt_data nu trebuie să consume limita
+            .order("timestamp", desc=True)     # cele mai NOI mesaje primele
             .limit(limit)
             .execute()
         )
-        return [{"role": row["role"], "content": row["content"]} for row in response.data]
+        # Query-ul a adus mesajele de la cel mai nou la cel mai vechi — le readucem în ordine cronologică
+        rows = list(reversed(response.data or []))
+        return [{"role": row["role"], "content": row["content"]} for row in rows]
     except Exception as e:
         _log("Eroare la încărcarea istoricului", "silent", e)
         return st.session_state.get("messages", [])[-limit:]
@@ -1729,21 +1160,27 @@ def is_valid_session_id(sid: str) -> bool:
     return bool(_SESSION_ID_RE.match(sid))
 
 
-def session_exists_in_db(session_id: str) -> bool:
-    """Verifică dacă un session_id există deja în Supabase."""
+def _session_owner(session_id: str) -> tuple[bool, str | None]:
+    """(există, liceu_user_id) pentru o sesiune. La eroare: (False, None)."""
     try:
         supabase = get_supabase_client()
         response = (
             supabase.table("sessions")
-            .select("session_id")
+            .select("session_id, liceu_user_id")
             .eq("session_id", session_id)
-            .eq("app_id", get_app_id())
             .limit(1)
             .execute()
         )
-        return len(response.data) > 0
+        if not response.data:
+            return False, None
+        return True, response.data[0].get("liceu_user_id")
     except Exception:
-        return False
+        return False, None
+
+
+def session_exists_in_db(session_id: str) -> bool:
+    """Verifică dacă un session_id există deja în Supabase."""
+    return _session_owner(session_id)[0]
 
 
 def register_session(session_id: str):
@@ -1753,19 +1190,747 @@ def register_session(session_id: str):
     try:
         client = get_supabase_client()
         now = time.time()
-        record = {
+        row = {
             "session_id": session_id,
             "created_at": now,
             "last_active": now,
-            "app_id": get_app_id()
+            "app_id": get_app_id(),
         }
-        # Atașează user_id dacă utilizatorul e autentificat
-        user_id = st.session_state.get("auth_user_id")
-        if user_id:
-            record["user_id"] = user_id
-        client.table("sessions").upsert(record).execute()
+        _uid = current_user_id()
+        if _uid:
+            row["liceu_user_id"] = _uid   # conversația aparține contului → apare pe toate device-urile
+        # ignore_duplicates: o sesiune existentă NU e suprascrisă (nici proprietarul, nici created_at)
+        client.table("sessions").upsert(row, ignore_duplicates=True).execute()
     except Exception as e:
         _log("Eroare la înregistrarea sesiunii", "silent", e)
+
+
+# === AUTENTIFICARE OPȚIONALĂ (cont elev) ===
+# Fără cont: aplicația merge ca înainte (conversațiile stau în acest browser).
+# Cu cont: conversațiile sunt legate de cont (sessions.liceu_user_id) și apar pe orice device.
+# „Ține-mă minte”: un token aleator stă în localStorage-ul browserului; în DB păstrăm doar
+# hash-ul lui (sha256), deci o scurgere a bazei nu permite logarea. Parolele: scrypt (stdlib).
+AUTH_TOKEN_DAYS = 180
+AUTH_MIN_PASSWORD = 8
+AUTH_MAX_FAILS = 5            # încercări greșite per email ...
+AUTH_FAIL_WINDOW = 600        # ... în 10 minute
+_EMAIL_RE = re.compile(r"^[^@\s:<>,;]{1,64}@[^@\s:<>,;]{1,255}\.[a-zA-Z]{2,24}$")
+
+
+def _normalize_email(email: str) -> str:
+    """Litere mici, fără spații și fără prefixul „mailto:” / paranteze <> (apar când emailul e
+    copiat dintr-un link — așa a ajuns în DB un cont „mailto:...”, imposibil de resetat)."""
+    e = (email or "").strip().strip("<>").strip()
+    e = re.sub(r"^mailto:", "", e, flags=re.IGNORECASE)
+    return e.split("?")[0].strip().lower()
+
+
+def current_user() -> dict | None:
+    return st.session_state.get("_auth_user")
+
+
+def current_user_id() -> str | None:
+    u = current_user()
+    return u.get("id") if u else None
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_bytes(16)
+    n, r, p = 2 ** 14, 8, 1
+    dk = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=32)
+    return f"scrypt${n}${r}${p}${salt.hex()}${dk.hex()}"
+
+
+def _verify_password(password: str, stored: str) -> bool:
+    try:
+        algo, n, r, p, salt_hex, dk_hex = stored.split("$")
+        if algo != "scrypt":
+            return False
+        dk = hashlib.scrypt(password.encode("utf-8"), salt=bytes.fromhex(salt_hex),
+                            n=int(n), r=int(r), p=int(p), dklen=len(dk_hex) // 2)
+        return hmac.compare_digest(dk.hex(), dk_hex)
+    except Exception:
+        return False
+
+
+def _token_hash(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@st.cache_resource
+def _get_auth_fail_store() -> dict:
+    return {"lock": threading.Lock(), "fails": defaultdict(list)}
+
+
+def _auth_blocked(email: str) -> bool:
+    store = _get_auth_fail_store()
+    with store["lock"]:
+        recent = [t for t in store["fails"][email] if t > time.time() - AUTH_FAIL_WINDOW]
+        store["fails"][email] = recent
+        return len(recent) >= AUTH_MAX_FAILS
+
+
+def _auth_note_fail(email: str):
+    store = _get_auth_fail_store()
+    with store["lock"]:
+        store["fails"][email].append(time.time())
+
+
+# Coloanele citite pentru utilizatorul logat (fără hash-uri). Cele de după display_name vin din
+# supabase_comercial.sql (profil, rol, vârstă, acord parental).
+_USER_COLS = ("id, email, display_name, role, clasa, filiera, profil_liceu, specializare, "
+              "birth_year, birth_month, parent_email, parental_status")
+
+
+def _public_user(row: dict) -> dict:
+    u = {"id": row["id"], "email": row["email"], "name": row.get("display_name") or row["email"].split("@")[0]}
+    for k in ("role", "clasa", "filiera", "profil_liceu", "specializare", "birth_year", "birth_month",
+              "parent_email", "parental_status"):
+        u[k] = row.get(k)
+    u["role"] = u["role"] or "student"
+    u["parental_status"] = u["parental_status"] or "not_required"
+    return u
+
+
+def refresh_current_user(max_age: float = 20.0):
+    """Recitește contul din DB (rol, acord parental, profil) — cel mult o dată la max_age secunde,
+    ca o schimbare făcută din altă parte (ex. părintele confirmă din email) să se vadă fără relogare."""
+    u = current_user()
+    if not u or time.time() - st.session_state.get("_auth_user_ts", 0) < max_age:
+        return
+    st.session_state["_auth_user_ts"] = time.time()
+    try:
+        res = get_supabase_client().table("liceu_users").select(_USER_COLS).eq("id", u["id"]).limit(1).execute()
+        if res.data:
+            st.session_state["_auth_user"] = _public_user(res.data[0])
+        else:
+            # contul a fost șters (ex. părintele a refuzat acordul)
+            st.session_state.pop("_auth_user", None)
+            _set_browser_token(None)
+    except Exception as e:
+        _log("Recitirea contului a eșuat", "silent", e)
+
+
+def auth_register(email: str, password: str, display_name: str = "", birth_year: int | None = None,
+                  birth_month: int | None = None, parent_email: str = "",
+                  accepted_terms: bool = False) -> tuple[dict | None, str]:
+    """Creează contul. Returnează (user, "") sau (None, mesaj_eroare).
+
+    Cu BILLING_MODE = "on": anul + luna nașterii sunt obligatorii; sub 18 ani emailul părintelui
+    e obligatoriu (plata o face părintele); sub 16 ani contul așteaptă acordul părintelui (link pe
+    email), iar peste 16 ani elevul acceptă singur Termenii și Politica de confidențialitate."""
+    email = _normalize_email(email)
+    if not _EMAIL_RE.match(email):
+        return None, "Adresa de email nu pare validă."
+    if len(password or "") < AUTH_MIN_PASSWORD:
+        return None, f"Parola trebuie să aibă cel puțin {AUTH_MIN_PASSWORD} caractere."
+    parent_email = _normalize_email(parent_email) if parent_email else ""
+    _strict = comercial.core.billing_on()
+    _needs_parent = comercial.core.needs_parental_consent(birth_year, birth_month) if birth_year else _strict
+    _minor = comercial.core.is_minor(birth_year, birth_month) if birth_year else _strict
+    if _strict:
+        if not birth_year or not birth_month:
+            return None, "Alege anul și luna nașterii."
+        if _minor and not _EMAIL_RE.match(parent_email or ""):
+            return None, "Pentru elevii sub 18 ani e nevoie de emailul unui părinte."
+        if _minor and parent_email == email:
+            return None, "Emailul părintelui trebuie să fie diferit de al tău."
+        if not _needs_parent and not accepted_terms:
+            return None, "Trebuie să accepți Termenii și Politica de confidențialitate."
+    client = get_supabase_client()
+    if client is None:
+        return None, "Baza de date nu e disponibilă acum. Încearcă mai târziu."
+    try:
+        exists = client.table("liceu_users").select("id").eq("email", email).limit(1).execute()
+        if exists.data:
+            return None, "Există deja un cont cu acest email. Folosește „Intră în cont”."
+        now = time.time()
+        _rec = _new_recovery_code()
+        res = client.table("liceu_users").insert({
+            "email": email,
+            "password_hash": _hash_password(password),
+            "recovery_hash": _hash_password(_normalize_recovery(_rec)),
+            "display_name": (display_name or "").strip()[:60] or None,
+            "created_at": now,
+            "last_login": now,
+            **({"birth_year": int(birth_year), "birth_month": int(birth_month or 0) or None,
+                "parent_email": parent_email or None,
+                "parental_status": "pending" if (_strict and _needs_parent) else "not_required"}
+               if birth_year else {}),
+        }).execute()
+        st.session_state["_auth_new_recovery"] = _rec   # afișat o singură dată după creare
+        user = _public_user(res.data[0])
+        if _strict and _needs_parent:
+            _ok, _msg = comercial.compliance.request_parental_consent(user, parent_email)
+            st.session_state["_auth_parent_flash"] = (_ok, _msg)
+        elif accepted_terms:
+            comercial.compliance.record_acceptance(user["id"], "elev", email)
+        return user, ""
+    except Exception as e:
+        _log("Înregistrare cont eșuată", "silent", e)
+        return None, "Contul nu a putut fi creat. Încearcă din nou."
+
+
+def auth_login(email: str, password: str) -> tuple[dict | None, str]:
+    email = _normalize_email(email)
+    if _auth_blocked(email):
+        return None, "Prea multe încercări greșite. Așteaptă 10 minute."
+    client = get_supabase_client()
+    if client is None:
+        return None, "Baza de date nu e disponibilă acum. Încearcă mai târziu."
+    try:
+        res = client.table("liceu_users").select(_USER_COLS + ", password_hash") \
+            .eq("email", email).limit(1).execute()
+    except Exception as e:
+        _log("Autentificare: eroare DB", "silent", e)
+        return None, "Autentificarea nu a mers acum. Încearcă din nou."
+    row = res.data[0] if res.data else None
+    if not row or not _verify_password(password or "", row["password_hash"]):
+        _auth_note_fail(email)
+        return None, "Email sau parolă greșită."
+    try:
+        client.table("liceu_users").update({"last_login": time.time()}).eq("id", row["id"]).execute()
+    except Exception:
+        pass
+    return _public_user(row), ""
+
+
+# --- Resetare parolă: cod prin email (Gmail SMTP) + cod de recuperare ---
+RESET_CODE_MINUTES = 15
+RESET_MAX_ATTEMPTS = 5
+RESET_EMAIL_COOLDOWN = 60        # secunde între două emailuri către aceeași adresă
+_RECOVERY_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"   # fără 0/O, 1/I
+
+
+def _new_recovery_code() -> str:
+    raw = "".join(secrets.choice(_RECOVERY_ALPHABET) for _ in range(12))
+    return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+
+def _normalize_recovery(code: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", (code or "").upper())
+
+
+def _reset_code_hash(user_id: str, code: str) -> str:
+    return hashlib.sha256(f"{user_id}:{code}".encode("utf-8")).hexdigest()
+
+
+def _smtp_config() -> dict | None:
+    try:
+        user = st.secrets.get("SMTP_USER", "")
+        pw = st.secrets.get("SMTP_PASSWORD", "")
+        if not user or not pw:
+            return None
+        return {"user": user, "password": str(pw).replace(" ", ""),
+                "host": st.secrets.get("SMTP_HOST", "smtp.gmail.com"),
+                "port": int(st.secrets.get("SMTP_PORT", 465)),
+                "sender": st.secrets.get("SMTP_FROM_NAME", "Profesor Liceu")}
+    except Exception:
+        return None
+
+
+def _send_email(to: str, subject: str, body: str) -> bool:
+    cfg = _smtp_config()
+    if not cfg:
+        return False
+    msg = EmailMessage()
+    msg["From"] = f"{cfg['sender']} <{cfg['user']}>"
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg.set_content(body)
+    try:
+        with smtplib.SMTP_SSL(cfg["host"], cfg["port"], timeout=20) as srv:
+            srv.login(cfg["user"], cfg["password"])
+            srv.send_message(msg)
+        return True
+    except Exception as e:
+        _log("Trimiterea emailului a eșuat", "silent", e)
+        return False
+
+
+@st.cache_resource
+def _get_reset_mail_store() -> dict:
+    return {"lock": threading.Lock(), "last": {}}
+
+
+def auth_request_reset_email(email: str) -> tuple[bool, str]:
+    """Trimite un cod de 6 cifre pe email. Mesajul e același dacă emailul există sau nu
+    (nu dezvăluim ce adrese au cont)."""
+    email = _normalize_email(email)
+    if not _EMAIL_RE.match(email):
+        return False, "Adresa de email nu pare validă."
+    if not _smtp_config():
+        return False, "Trimiterea de emailuri nu e configurată. Folosește codul de recuperare."
+    store = _get_reset_mail_store()
+    with store["lock"]:
+        if time.time() - store["last"].get(email, 0) < RESET_EMAIL_COOLDOWN:
+            return False, "Ți-am trimis deja un cod. Verifică emailul (și Spam) sau încearcă peste un minut."
+        store["last"][email] = time.time()
+    generic = (f"Dacă există un cont cu {email}, am trimis un cod de 6 cifre (valabil "
+               f"{RESET_CODE_MINUTES} minute). Verifică și folderul Spam.")
+    client = get_supabase_client()
+    if client is None:
+        return False, "Baza de date nu e disponibilă acum. Încearcă mai târziu."
+    try:
+        res = client.table("liceu_users").select("id").eq("email", email).limit(1).execute()
+        if not res.data:
+            return True, generic
+        uid = res.data[0]["id"]
+        code = f"{secrets.randbelow(10 ** 6):06d}"
+        now = time.time()
+        client.table("liceu_password_resets").upsert({
+            "user_id": uid, "code_hash": _reset_code_hash(uid, code),
+            "expires_at": now + RESET_CODE_MINUTES * 60, "attempts": 0, "created_at": now,
+        }).execute()
+    except Exception as e:
+        _log("Cerere resetare parolă: eroare DB", "silent", e)
+        return False, "Nu am putut genera codul acum. Încearcă din nou."
+    body = (f"Salut!\n\nCodul tău pentru resetarea parolei în Profesor Liceu este:\n\n    {code}\n\n"
+            f"Codul e valabil {RESET_CODE_MINUTES} minute. Dacă nu ai cerut tu resetarea, "
+            "ignoră acest email — parola ta rămâne neschimbată.\n")
+    if not _send_email(email, f"Codul tău Profesor Liceu: {code}", body):
+        return False, "Emailul nu a putut fi trimis acum. Încearcă din nou sau folosește codul de recuperare."
+    return True, generic
+
+
+def auth_reset_password(email: str, code: str, new_password: str) -> tuple[dict | None, str]:
+    """Schimbă parola folosind codul din email (6 cifre) SAU codul de recuperare.
+    La succes: toate dispozitivele sunt deconectate; dacă s-a folosit codul de recuperare,
+    se generează unul nou (pus în st.session_state["_auth_new_recovery"])."""
+    email = _normalize_email(email)
+    code = (code or "").strip()
+    if len(new_password or "") < AUTH_MIN_PASSWORD:
+        return None, f"Parola nouă trebuie să aibă cel puțin {AUTH_MIN_PASSWORD} caractere."
+    if _auth_blocked(email):
+        return None, "Prea multe încercări greșite. Așteaptă 10 minute."
+    bad = "Email sau cod greșit (ori codul a expirat)."
+    client = get_supabase_client()
+    if client is None:
+        return None, "Baza de date nu e disponibilă acum. Încearcă mai târziu."
+    try:
+        res = client.table("liceu_users").select(_USER_COLS + ", recovery_hash") \
+            .eq("email", email).limit(1).execute()
+        row = res.data[0] if res.data else None
+        if not row:
+            _auth_note_fail(email)
+            return None, bad
+        uid = row["id"]
+        used_recovery = False
+        if re.fullmatch(r"\d{6}", code):
+            r = client.table("liceu_password_resets").select("code_hash, expires_at, attempts") \
+                .eq("user_id", uid).limit(1).execute()
+            rr = r.data[0] if r.data else None
+            if (not rr or rr["expires_at"] < time.time() or rr["attempts"] >= RESET_MAX_ATTEMPTS
+                    or not hmac.compare_digest(rr["code_hash"], _reset_code_hash(uid, code))):
+                if rr:
+                    client.table("liceu_password_resets").update({"attempts": rr["attempts"] + 1}) \
+                        .eq("user_id", uid).execute()
+                _auth_note_fail(email)
+                return None, bad
+        else:
+            if not row.get("recovery_hash") or not _verify_password(_normalize_recovery(code), row["recovery_hash"]):
+                _auth_note_fail(email)
+                return None, bad
+            used_recovery = True
+        update = {"password_hash": _hash_password(new_password), "last_login": time.time()}
+        if used_recovery:
+            new_rec = _new_recovery_code()        # codul de recuperare e de unică folosință
+            update["recovery_hash"] = _hash_password(_normalize_recovery(new_rec))
+        client.table("liceu_users").update(update).eq("id", uid).execute()
+        client.table("liceu_password_resets").delete().eq("user_id", uid).execute()
+        client.table("liceu_tokens").delete().eq("user_id", uid).execute()   # deconectăm peste tot
+        if used_recovery:
+            st.session_state["_auth_new_recovery"] = new_rec
+        return _public_user(row), ""
+    except Exception as e:
+        _log("Resetare parolă eșuată", "silent", e)
+        return None, "Parola nu a putut fi schimbată acum. Încearcă din nou."
+
+
+def auth_regenerate_recovery() -> bool:
+    uid = current_user_id()
+    if not uid:
+        return False
+    rec = _new_recovery_code()
+    try:
+        get_supabase_client().table("liceu_users").update(
+            {"recovery_hash": _hash_password(_normalize_recovery(rec))}).eq("id", uid).execute()
+        st.session_state["_auth_new_recovery"] = rec
+        return True
+    except Exception as e:
+        _log("Cod de recuperare nou eșuat", "silent", e)
+        return False
+
+
+def _dismiss_recovery():
+    st.session_state.pop("_auth_new_recovery", None)
+
+
+def _issue_remember_token(user_id: str) -> str | None:
+    raw = secrets.token_urlsafe(32)
+    now = time.time()
+    try:
+        get_supabase_client().table("liceu_tokens").insert({
+            "token_hash": _token_hash(raw),
+            "user_id": user_id,
+            "created_at": now,
+            "expires_at": now + AUTH_TOKEN_DAYS * 86400,
+            "last_used": now,
+        }).execute()
+        return raw
+    except Exception as e:
+        _log("Token „ține-mă minte” nu a putut fi creat", "silent", e)
+        return None
+
+
+def _user_from_token(raw: str) -> dict | None:
+    """Returnează utilizatorul pentru token (și prelungește valabilitatea), sau None."""
+    if not raw or not isinstance(raw, str) or len(raw) > 200:
+        return None
+    try:
+        client = get_supabase_client()
+        th = _token_hash(raw)
+        res = client.table("liceu_tokens").select("user_id, expires_at").eq("token_hash", th).limit(1).execute()
+        if not res.data or res.data[0]["expires_at"] < time.time():
+            return None
+        u = client.table("liceu_users").select(_USER_COLS) \
+            .eq("id", res.data[0]["user_id"]).limit(1).execute()
+        if not u.data:
+            return None
+        now = time.time()
+        client.table("liceu_tokens").update({
+            "last_used": now, "expires_at": now + AUTH_TOKEN_DAYS * 86400,
+        }).eq("token_hash", th).execute()
+        client.table("liceu_users").update({"last_login": now}).eq("id", u.data[0]["id"]).execute()
+        return _public_user(u.data[0])
+    except Exception as e:
+        _log("Restaurare login din token eșuată", "silent", e)
+        return None
+
+
+def _set_browser_token(raw: str | None):
+    """Programează scrierea/ștergerea tokenului în localStorage (scriptul e randat la fiecare run
+    de inject_session_js; conținut identic = nu se re-execută)."""
+    st.session_state["_auth_ls_js"] = (
+        f"localStorage.setItem('profesor_auth_token', {json.dumps(raw)});" if raw
+        else "localStorage.removeItem('profesor_auth_token');"
+    )
+
+
+def _claim_browser_sessions(user_id: str):
+    """Conversațiile anonime din acest browser trec în contul utilizatorului."""
+    sids = [s for s in set(st.session_state.get("_my_session_ids", []) + [st.session_state.get("session_id", "")])
+            if is_valid_session_id(s)]
+    if not sids:
+        return
+    try:
+        get_supabase_client().table("sessions").update({"liceu_user_id": user_id}) \
+            .in_("session_id", sids).is_("liceu_user_id", "null").execute()
+    except Exception as e:
+        _log("Atașarea conversațiilor la cont a eșuat", "silent", e)
+
+
+def auth_complete_login(user: dict, remember: bool):
+    st.session_state["_auth_user"] = user
+    _claim_browser_sessions(user["id"])
+    _set_browser_token(_issue_remember_token(user["id"]) if remember else None)
+    st.session_state["_sid_registered"] = set()   # re-verificăm proprietarul sesiunii curente
+    invalidate_session_cache()
+
+
+def auth_logout(all_devices: bool = False):
+    user = current_user()
+    raw = (st.session_state.get("_browser_storage") or {}).get("token") or st.session_state.get("_auth_raw_token")
+    try:
+        client = get_supabase_client()
+        if user and all_devices:
+            client.table("liceu_tokens").delete().eq("user_id", user["id"]).execute()
+        elif raw:
+            client.table("liceu_tokens").delete().eq("token_hash", _token_hash(raw)).execute()
+    except Exception as e:
+        _log("Ștergere token la deconectare eșuată", "silent", e)
+    st.session_state.pop("_auth_user", None)
+    st.session_state.pop("_auth_raw_token", None)
+    st.session_state.pop("_acct_keys", None)
+    if isinstance(st.session_state.get("_browser_storage"), dict):
+        st.session_state["_browser_storage"]["token"] = ""
+    _set_browser_token(None)
+    # Conversația curentă aparține contului: pornim una nouă, anonimă, pe acest browser.
+    new_sid = generate_unique_session_id()
+    st.session_state["_sid_registered"] = set()
+    register_session(new_sid)
+    st.session_state["_my_session_ids"] = [new_sid]
+    switch_session(new_sid)
+    try:
+        st.query_params["sid"] = new_sid
+    except Exception:
+        pass
+
+
+# --- Cheile API Gemini ale elevului, salvate în cont (criptate) ---
+# Elevul poate adăuga mai multe chei (ex. de la părinți/rude, fiecare cont Google = proiect
+# separat = cote separate). Cheile sunt criptate cu Fernet (AES-128-CBC + HMAC) ÎNAINTE de a
+# ajunge în Supabase. Cheia de criptare: secrets KEYS_ENCRYPTION_SECRET (recomandat); dacă lipsește,
+# e derivată din SUPABASE_KEY. Prefixul textului criptat spune ce cheie a fost folosită.
+MAX_ACCOUNT_KEYS = 10
+
+
+def _fernet_for(tag: str):
+    from cryptography.fernet import Fernet
+    import base64 as _b64
+    if tag == "s1":
+        secret = str(st.secrets.get("KEYS_ENCRYPTION_SECRET", ""))
+    else:
+        secret = "derived:" + str(st.secrets.get("SUPABASE_KEY", ""))
+    if not secret or secret == "derived:":
+        raise RuntimeError("Nu există niciun secret pentru criptarea cheilor")
+    raw = hashlib.sha256(b"profesor-liceu-api-keys:" + secret.encode("utf-8")).digest()
+    return Fernet(_b64.urlsafe_b64encode(raw))
+
+
+def _encrypt_api_key(plain: str) -> str:
+    tag = "s1" if st.secrets.get("KEYS_ENCRYPTION_SECRET", "") else "d1"
+    return f"{tag}:" + _fernet_for(tag).encrypt(plain.encode("utf-8")).decode("ascii")
+
+
+def _decrypt_api_key(enc: str) -> str | None:
+    try:
+        tag, token = enc.split(":", 1)
+        return _fernet_for(tag).decrypt(token.encode("ascii")).decode("utf-8")
+    except Exception as e:
+        _log("O cheie API din cont nu a putut fi decriptată", "silent", e)
+        return None
+
+
+def _plausible_api_key(k: str) -> bool:
+    return bool(k) and 15 <= len(k) <= 200 and not any(ch.isspace() for ch in k)
+
+
+def acct_keys_load(force: bool = False) -> list:
+    """Cheile din contul utilizatorului logat: [{id, label, hint, key}] (cache în sesiune)."""
+    uid = current_user_id()
+    if not uid:
+        return []
+    cache = st.session_state.get("_acct_keys")
+    if cache is not None and not force and cache.get("uid") == uid:
+        return cache["items"]
+    items = []
+    try:
+        res = get_supabase_client().table("liceu_api_keys").select("id, label, key_enc, key_hint, created_at") \
+            .eq("user_id", uid).order("created_at").execute()
+        for r in res.data or []:
+            k = _decrypt_api_key(r["key_enc"])
+            if k:
+                items.append({"id": r["id"], "label": r.get("label") or "Cheie", "hint": r.get("key_hint") or "", "key": k})
+    except Exception as e:
+        _log("Cheile din cont nu au putut fi încărcate", "silent", e)
+        return (cache or {}).get("items", [])
+    st.session_state["_acct_keys"] = {"uid": uid, "items": items}
+    return items
+
+
+def _check_api_key_live(k: str) -> tuple[bool, str]:
+    """Verifică cheia la Google fără să consume din cota de generare (models.get)."""
+    try:
+        genai.Client(api_key=k).models.get(model=GEMINI_MODEL)
+        return True, ""
+    except Exception as e:
+        low = (str(e) + repr(e)).lower()
+        if "api_key_invalid" in low or "api key not valid" in low or "invalid api key" in low:
+            return False, "Google spune că cheia nu e validă. Verifică să o fi copiat complet."
+        if "permission_denied" in low or "403" in low:
+            return False, "Cheia nu are acces la Gemini API (activează „Generative Language API” în proiect)."
+        return True, "Nu am putut verifica acum cheia la Google; am salvat-o oricum."
+
+
+def acct_key_add(label: str, key: str) -> tuple[bool, str]:
+    uid = current_user_id()
+    if not uid:
+        return False, "Trebuie să fii conectat la cont."
+    key = (key or "").strip().strip('"').strip("'")
+    if not _plausible_api_key(key):
+        return False, "Cheie invalidă: fără spații, minim 15 caractere."
+    existing = acct_keys_load(force=True)
+    if any(it["key"] == key for it in existing):
+        return False, "Cheia aceasta e deja salvată în cont."
+    if len(existing) >= MAX_ACCOUNT_KEYS:
+        return False, f"Poți salva cel mult {MAX_ACCOUNT_KEYS} chei."
+    ok, note = _check_api_key_live(key)
+    if not ok:
+        return False, note
+    try:
+        get_supabase_client().table("liceu_api_keys").insert({
+            "user_id": uid,
+            "label": (label or "").strip()[:40] or f"Cheia {len(existing) + 1}",
+            "key_enc": _encrypt_api_key(key),
+            "key_hint": key[-4:],
+            "created_at": time.time(),
+        }).execute()
+    except Exception as e:
+        _log("Salvarea cheii în cont a eșuat", "silent", e)
+        return False, "Cheia nu a putut fi salvată acum. Încearcă din nou."
+    acct_keys_load(force=True)
+    return True, note
+
+
+def acct_key_delete(key_id: str):
+    uid = current_user_id()
+    if not uid:
+        return
+    try:
+        get_supabase_client().table("liceu_api_keys").delete().eq("id", key_id).eq("user_id", uid).execute()
+    except Exception as e:
+        _log("Ștergerea cheii din cont a eșuat", "silent", e)
+    acct_keys_load(force=True)
+
+
+# --- Citirea cheii API dintr-o poză / captură de ecran ---
+# Cheile sunt lungi (AIza... 39 de caractere) și greu de tastat pe telefon. OCR-ul clasic (Tesseract)
+# confundă I/l/1 și O/0, deci folosim Gemini. Ce cheie folosim pentru citire: oricare cheie deja
+# disponibilă (secrets / cont / browser) sau OCR_API_KEY din secrets — o cheie a ta, folosită DOAR
+# aici, ca elevul să-și poată citi prima cheie din poză. Limită: 10 poze / sesiune.
+_KEY_PATTERNS = [re.compile(r"AIza[0-9A-Za-z_\-]{35}"), re.compile(r"AQ\.[0-9A-Za-z_\-\.]{20,200}")]
+KEY_PHOTO_MAX_PER_SESSION = 10
+
+
+def _find_api_key_in_text(text: str) -> str | None:
+    flat = re.sub(r"\s+", "", text or "")
+    for pat in _KEY_PATTERNS:
+        m = pat.search(flat)
+        if m:
+            return m.group(0)
+    return None
+
+
+def _ocr_keys_available(extra_keys: list) -> list:
+    pool = [k for k in (extra_keys or []) if k]
+    try:
+        ocr = str(st.secrets.get("OCR_API_KEY", "")).strip()
+    except Exception:
+        ocr = ""
+    if ocr and ocr not in pool:
+        pool.append(ocr)
+    return pool
+
+
+def _read_api_key_from_image(data: bytes, mime: str, pool: list) -> tuple[str | None, str]:
+    """Returnează (cheia, mesaj). Încearcă pe rând cheile disponibile × 3 modele mici."""
+    if not pool:
+        return None, ("Citirea din poză are nevoie de o cheie deja configurată. Adaug-o o dată prin copy-paste "
+                      "(de pe calculator, de exemplu) — dacă ești logat, apare apoi automat și pe telefon.")
+    n = st.session_state.get("_key_photo_count", 0)
+    if n >= KEY_PHOTO_MAX_PER_SESSION:
+        return None, "Ai atins limita de poze citite în această sesiune. Lipește cheia manual."
+    st.session_state["_key_photo_count"] = n + 1
+    prompt = ("Imaginea conține o cheie API Google (începe cu „AIza” sau cu „AQ.”). Transcrie DOAR cheia, exact, "
+              "caracter cu caracter, fără spații și fără alt text. Atenție la caracterele asemănătoare: "
+              "O (litera) / 0 (cifra), l (L mic) / I (i mare) / 1, S / 5, Z / 2. "
+              "Dacă nu vezi nicio cheie, răspunde exact: NIMIC")
+    models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.5-flash-lite"]
+    last_err = ""
+    for k in pool[:4]:
+        for m in models:
+            try:
+                cfg = genai_types.GenerateContentConfig(
+                    thinking_config=(genai_types.ThinkingConfig(thinking_budget=0) if m.startswith("gemini-2.5")
+                                     else genai_types.ThinkingConfig(thinking_level="low")))
+                resp = genai.Client(api_key=k).models.generate_content(
+                    model=m,
+                    contents=[genai_types.Part.from_bytes(data=data, mime_type=mime or "image/jpeg"), prompt],
+                    config=cfg,
+                )
+                found = _find_api_key_in_text(getattr(resp, "text", "") or "")
+                if found:
+                    return found, ""
+                return None, "Nu am găsit nicio cheie în poză. Încearcă o poză mai clară, doar cu cheia, sau lipește-o."
+            except Exception as e:
+                last_err = str(e)
+                low = last_err.lower()
+                if "429" in low or "quota" in low or "resource_exhausted" in low or "404" in low \
+                        or "not found" in low or "503" in low or "unavailable" in low:
+                    continue          # model/cheie indisponibile → următoarea variantă
+                break                 # cheie invalidă etc. → trecem la cheia următoare
+    _log("Citirea cheii din poză a eșuat", "silent", Exception(last_err))
+    return None, "Nu am putut citi poza acum (serviciul AI e ocupat). Încearcă din nou sau lipește cheia."
+
+
+def _key_photo_reader(target_key: str, pool: list):
+    """Uploader „📷 poză cu cheia”: citește cheia și o pune în câmpul `target_key` (înainte ca acesta să fie randat)."""
+    up = st.file_uploader("📷 Sau încarcă o poză / captură de ecran cu cheia",
+                          type=["jpg", "jpeg", "png", "webp", "heic", "heif"], key=f"{target_key}__photo",
+                          help="Pe telefon poți face direct o poză ecranului calculatorului cu cheia afișată.")
+    if not up:
+        return
+    sig = (up.name, up.size)
+    if st.session_state.get(f"{target_key}__photo_sig") == sig:
+        return
+    st.session_state[f"{target_key}__photo_sig"] = sig
+    with st.spinner("🔍 Citesc cheia din poză..."):
+        found, note = _read_api_key_from_image(up.getvalue(), up.type, pool)
+    if not found:
+        st.session_state[f"{target_key}__photo_msg"] = ("error", note)
+        return
+    ok, why = _check_api_key_live(found)
+    st.session_state[target_key] = found
+    if ok:
+        st.session_state[f"{target_key}__photo_msg"] = (
+            "ok", f"✅ Am citit cheia (…{found[-4:]}) și Google o acceptă. Apasă butonul de mai jos ca s-o salvezi.")
+    else:
+        st.session_state[f"{target_key}__photo_msg"] = (
+            "warn", f"⚠️ Am citit „…{found[-6:]}”, dar Google nu o acceptă — probabil un caracter citit greșit. "
+                    "Verifică-l în câmp sau lipește cheia manual.")
+
+
+def _key_photo_message(target_key: str):
+    msg = st.session_state.pop(f"{target_key}__photo_msg", None)
+    if msg:
+        {"ok": st.success, "warn": st.warning, "error": st.error}[msg[0]](msg[1])
+
+
+def _resolve_session_for_user(sid: str) -> str:
+    """Înregistrează sid-ul dacă e nou. Dacă aparține ALTUI cont, nu îl deschidem: pornim o
+    conversație nouă (ID-ul din link nu mai e suficient pentru a citi conversația unui cont)."""
+    reg = st.session_state.setdefault("_sid_registered", set())
+    if sid in reg:
+        return sid
+    exists, owner = _session_owner(sid)
+    if exists and owner and owner != current_user_id():
+        sid = generate_unique_session_id()
+        exists = False
+    if not exists:
+        register_session(sid)
+    if st.session_state.get("_sb_online", True):
+        reg.add(sid)
+    return sid
+
+
+def load_browser_storage_and_login():
+    """O dată per sesiune Streamlit: citește din browser SID-ul, lista de conversații și tokenul
+    de login (componenta session_bridge), apoi restaurează automat contul din token."""
+    if "_browser_storage" not in st.session_state:
+        val = _session_bridge(key="_session_bridge", default=None) if _session_bridge is not None else {}
+        if val is None:
+            st.markdown(
+                '<div style="display:flex;align-items:center;justify-content:center;'
+                'min-height:40vh;color:#888;font-size:15px;">🎓 Se încarcă...</div>',
+                unsafe_allow_html=True,
+            )
+            st.caption("Dacă pagina rămâne aici mai mult de câteva secunde, apasă mai jos.")
+            if st.button("🔄 Continuă", key="_session_gate_manual_continue"):
+                st.session_state["_browser_storage"] = {}
+                st.rerun()
+            st.stop()
+        st.session_state["_browser_storage"] = val if isinstance(val, dict) else {}
+    if not st.session_state.get("_auth_restore_done"):
+        st.session_state["_auth_restore_done"] = True
+        raw = (st.session_state["_browser_storage"] or {}).get("token") or ""
+        if raw and not current_user():
+            user = _user_from_token(raw)
+            if user:
+                st.session_state["_auth_user"] = user
+                st.session_state["_auth_raw_token"] = raw
+            elif is_supabase_available() and get_supabase_client() is not None:
+                _set_browser_token(None)   # token expirat/revocat → îl scoatem din browser
 
 
 def update_session_activity(session_id: str):
@@ -1787,103 +1952,74 @@ def update_session_activity(session_id: str):
 
 def inject_session_js():
     """
-    JS care sincronizează SID-ul și remember token-ul între Python și localStorage.
+    JS care sincronizează SID-ul confirmat (din st.session_state) cu localStorage
+    și curăță URL-ul vizual de parametrul ?sid=.
 
-    FIX persistență autentificare:
-      - ?rmt= era șters din URL când JS curăța ?sid= via replaceState → Python
-        nu-l mai vedea la reruns și nu restaura sesiunea.
-      - ?rmt= nu era salvat în localStorage → după restart telefon/browser nu
-        putea fi restaurat.
-
-    Acum:
-      - Când curăță ?sid=, păstrează ?rmt= în URL.
-      - Salvează rmt în localStorage (cheia 'profesor_rmt').
-      - La revenire (restart/tab nou fără ?rmt= în URL): citește rmt din
-        localStorage și îl repune în URL → Python îl vede și restaurează sesiunea.
+    FIX PERSISTENȚĂ (v2): logica de "compară și redirectează dacă diferă" a fost
+    mutată în get_or_create_session_id() (gate cu st.stop(), rulează ÎNAINTE de orice
+    altă logică Python). La momentul în care inject_session_js() rulează, SID-ul din
+    st.session_state e deja cel corect — fie a venit valid prin URL, fie a fost
+    confirmat de gate-ul de mai sus. Aici doar sincronizăm localStorage (idempotent)
+    și ascundem ?sid= din bara de adrese.
     """
     current_sid = st.session_state.get("session_id", "")
-    current_rmt = st.query_params.get("rmt", "")
+    # FIX PERSISTENȚĂ LISTĂ CONVERSAȚII: citim lista de "sesiuni cunoscute ale acestui
+    # browser" din query param-ul ?known= dacă e prezent (SID-uri separate prin virgulă).
+    _known_from_url = st.query_params.get("known", "")
+    if _known_from_url:
+        _known_ids = [s for s in _known_from_url.split(",") if is_valid_session_id(s)]
+        if _known_ids:
+            _existing = set(st.session_state.get("_my_session_ids", []))
+            st.session_state["_my_session_ids"] = list(_existing.union(_known_ids))
+
+    _auth_js = st.session_state.get("_auth_ls_js")
+    if _auth_js:
+        # scriere/ștergere token „ține-mă minte” (identic la fiecare run → se execută o singură dată)
+        components.html(f"<script>try{{{_auth_js}}}catch(e){{}}</script>", height=0)
+
     components.html(f"""
     <script>
     (function() {{
         const SID_KEY    = 'profesor_session_id';
         const APIKEY_KEY = 'profesor_api_key';
-        const RMT_KEY    = 'profesor_rmt';
+        const KNOWN_KEY  = 'profesor_known_sessions';
         const params     = new URLSearchParams(window.parent.location.search);
         const sidInUrl   = params.get('sid');
-        const rmtInUrl   = params.get('rmt');
         const pythonSid  = {json.dumps(current_sid)};
-        const pythonRmt  = {json.dumps(current_rmt)};
 
-        // ── Salvează rmt în localStorage ori de câte ori îl avem în URL sau Python ──
-        const rmtToSave = rmtInUrl || pythonRmt;
-        if (rmtToSave && rmtToSave.length > 20) {{
-            localStorage.setItem(RMT_KEY, rmtToSave);
+        // Sincronizare idempotentă — SID-ul curent e deja cel confirmat
+        if (pythonSid && pythonSid.length >= 16) {{
+            localStorage.setItem(SID_KEY, pythonSid);
+
+            // FIX PERSISTENȚĂ LISTĂ CONVERSAȚII: adăugăm SID-ul curent în lista
+            // locală de "sesiuni cunoscute ale acestui browser", persistată în
+            // localStorage (nu doar în st.session_state, care se reseta la orice
+            // restart/reload real). Best-effort: nu forțăm niciun reload pentru asta
+            // — lista se va sincroniza complet la următorul reload natural al paginii
+            // (buton "Conversație nouă" din sidebar pune ?known= explicit, vezi mai jos).
+            let known = [];
+            try {{
+                known = JSON.parse(localStorage.getItem(KNOWN_KEY) || '[]');
+                if (!Array.isArray(known)) known = [];
+            }} catch (e) {{ known = []; }}
+            if (!known.includes(pythonSid)) {{
+                known.push(pythonSid);
+                if (known.length > 50) known = known.slice(-50);
+                localStorage.setItem(KNOWN_KEY, JSON.stringify(known));
+            }}
         }}
 
-        // ── Sincronizare SID: URL → localStorage ──
-        // IMPORTANT: păstrăm ?rmt= în URL când ștergem ?sid=
-        if (sidInUrl && sidInUrl.length >= 16) {{
-            localStorage.setItem(SID_KEY, sidInUrl);
+        // Curăță URL-ul vizual (sid/apikey/known nu trebuie să rămână vizibile)
+        if (sidInUrl || params.get('apikey') || params.get('known')) {{
             params.delete('sid');
             params.delete('apikey');
-            // Nu atingem params 'rmt' — rămâne în URL
+            params.delete('known');
             const newUrl = window.parent.location.pathname +
                 (params.toString() ? '?' + params.toString() : '');
             window.parent.history.replaceState(null, '', newUrl);
         }}
 
-        // ── Revenire după restart/tab nou ──
-        // Dacă nu avem nici sid în URL, nici sid în Python → browser nou/restart
-        if (!sidInUrl && (!pythonSid || pythonSid.length < 16)) {{
-            const storedSid = localStorage.getItem(SID_KEY);
-            const storedRmt = localStorage.getItem(RMT_KEY);
-            if (storedSid && storedSid.length >= 16) {{
-                params.set('sid', storedSid);
-                params.delete('apikey');
-                // Restaurăm și rmt dacă nu e deja în URL
-                if (storedRmt && storedRmt.length > 20 && !params.get('rmt')) {{
-                    params.set('rmt', storedRmt);
-                }}
-                const newUrl = window.parent.location.pathname + '?' + params.toString();
-                window.parent.history.replaceState(null, '', newUrl);
-                window.parent.location.href = newUrl;
-            }}
-        }}
-
-        // ── Dacă avem sid dar nu rmt în URL, restaurăm rmt din localStorage ──
-        // Acoperă cazul: Python a pus ?sid= dar a omis ?rmt= (ex: după logout parțial)
-        if (!rmtInUrl && !pythonRmt) {{
-            const storedRmt = localStorage.getItem(RMT_KEY);
-            if (storedRmt && storedRmt.length > 20) {{
-                params.set('rmt', storedRmt);
-                const newUrl = window.parent.location.pathname + '?' + params.toString();
-                window.parent.history.replaceState(null, '', newUrl);
-                window.parent.location.href = newUrl;
-            }}
-        }}
-
-        // ── API key via postMessage ──
-        const storedKey = localStorage.getItem(APIKEY_KEY);
-        if (storedKey && storedKey.startsWith('AIza')) {{
-            window.parent.postMessage({{ type: 'profesor_apikey', key: storedKey }}, '*');
-        }}
     }})();
-    </script>
-
-    <script>
-    window._saveApiKeyToStorage = function(key) {{
-        if (key && key.startsWith('AIza')) {{
-            localStorage.setItem('profesor_api_key', key);
-        }}
-    }};
-    window._clearStoredApiKey = function() {{
-        localStorage.removeItem('profesor_api_key');
-    }};
-    // Funcție apelată la logout pentru a curăța rmt din localStorage
-    window._clearRmtFromStorage = function() {{
-        localStorage.removeItem('profesor_rmt');
-    }};
     </script>
     """, height=0)
 
@@ -1900,27 +2036,97 @@ def get_or_create_session_id() -> str:
 
     Flux revenire (bookmark, restart telefon):
       Elevul deschide URL-ul cu ?sid= → Python îl citește → restaurează istoricul
+
+    FIX PERSISTENȚĂ (v2 — gate explicit): Vechea variantă genera un SID nou și lăsa
+    SCRIPTUL ÎNTREG să ruleze cu el (inclusiv încărcarea istoricului, care apărea gol
+    pentru elev) ÎNAINTE ca JS-ul să aibă șansa să verifice localStorage și să
+    redirecteze. Userul vedea mereu un flash de conversație goală, și pe conexiuni
+    lente sau redirect-uri ratate (storage partitioning pe Safari iOS/Chrome mobil),
+    putea rămâne blocat pe sesiunea fantomă.
+
+    Acum: dacă URL-ul e curat (fără ?sid= valid), NU continuăm scriptul deloc.
+    Injectăm imediat un JS minimal care verifică localStorage și apoi:
+      - dacă găsește un SID vechi → redirect direct la el (sesiunea veche se restaurează,
+        elevul nu vede niciodată ecranul gol)
+      - dacă nu găsește nimic (vizită cu adevărat nouă) → confirmă SID-ul nou prin URL
+        și reîncarcă o singură dată
+    În ambele cazuri folosim st.stop() — restul aplicației Python nu rulează până
+    nu avem un ?sid= confirmat în URL.
     """
     # Citește ?sid= din URL — sursa de adevăr
     sid_from_url = st.query_params.get("sid", "")
 
     if is_valid_session_id(sid_from_url):
         # URL are ?sid= valid — înregistrează dacă e nou, altfel restaurează
-        if not session_exists_in_db(sid_from_url):
-            register_session(sid_from_url)
+        # O singură verificare în DB per SID și sesiune Streamlit (înainte: un query la FIECARE rerun).
+        # Nu marcăm SID-ul ca verificat cât Supabase e offline — altfel nu s-ar mai înregistra niciodată.
+        _resolved = _resolve_session_for_user(sid_from_url)
+        if _resolved != sid_from_url:
+            # conversația din link aparține altui cont → pornim una nouă
+            st.session_state["session_id"] = _resolved
+            try:
+                st.query_params["sid"] = _resolved
+            except Exception:
+                pass
+            return _resolved
         st.session_state["session_id"] = sid_from_url
+        # FIX PERSISTENȚĂ LISTĂ CONVERSAȚII: dacă gate-ul de mai jos a transmis
+        # ?known= la restaurare (vezi blocul JS), îl absorbim aici în session_state
+        # ca să poată fi folosit de sidebar-ul "Conversații anterioare".
+        _known_param = st.query_params.get("known", "")
+        if _known_param:
+            _known_ids = [s for s in _known_param.split(",") if is_valid_session_id(s)]
+            if _known_ids:
+                _existing = set(st.session_state.get("_my_session_ids", []))
+                st.session_state["_my_session_ids"] = list(_existing.union(_known_ids))
         return sid_from_url
 
-    # Nu există ?sid= valid în URL — prima vizită cu URL curat
-    # NU citim din session_state — poate conține SID-ul altui utilizator
-    new_id = generate_unique_session_id()
-    register_session(new_id)
+    # Nu există ?sid= valid în URL.
+    # FIX: Verificăm dacă avem deja un SID în session_state din acest run
+    # (poate fi setat de JS prin query param la un rerun anterior în aceeași sesiune Streamlit).
+    existing_in_state = st.session_state.get("session_id", "")
+    if is_valid_session_id(existing_in_state):
+        existing_in_state = _resolve_session_for_user(existing_in_state)
+        st.session_state["session_id"] = existing_in_state
+        # Repunem în URL pentru consistență (JS îl va citi și salva în localStorage)
+        try:
+            st.query_params["sid"] = existing_in_state
+        except Exception:
+            pass
+        return existing_in_state
+
+    # ── GATE: URL complet curat, fără SID nicăieri ──
+    # Citim din localStorage SID-ul salvat (și lista de conversații ale browserului) prin
+    # componenta session_bridge, care TRIMITE valorile spre Python. Înainte, un script încerca
+    # window.parent.location.replace(...) din iframe-ul components.html; iframe-ul e izolat
+    # (sandbox), iar Chrome/Edge blochează navigarea paginii-părinte → pagina rămânea blocată
+    # la „Se încarcă...” și istoricul nu se mai restaura. Acum nu mai navigăm deloc:
+    # Python primește SID-ul, îl pune în ?sid= și rularea continuă normal.
+    candidate_id = generate_unique_session_id()
+    _force_new = st.query_params.get("new", "") == "1"
+
+    # Valorile din localStorage au fost citite de load_browser_storage_and_login()
+    _stored = st.session_state.get("_browser_storage") or {}
+    _stored_sid = str(_stored.get("sid") or "")
+    if not _force_new and is_valid_session_id(_stored_sid):
+        sid = _stored_sid          # browserul a mai folosit aplicația → restaurăm conversația
+    else:
+        sid = candidate_id         # vizită nouă (sau ?new=1 / stocare blocată)
+
+    _known_ids = [s for s in (_stored.get("known") or []) if isinstance(s, str) and is_valid_session_id(s)]
+    if _known_ids:
+        _existing = set(st.session_state.get("_my_session_ids", []))
+        st.session_state["_my_session_ids"] = list(_existing.union(_known_ids))
+
+    sid = _resolve_session_for_user(sid)
+    st.session_state["session_id"] = sid
     try:
-        st.query_params["sid"] = new_id
+        if "new" in st.query_params:
+            del st.query_params["new"]
+        st.query_params["sid"] = sid   # Streamlit actualizează URL-ul fără reîncărcare
     except Exception:
         pass
-    st.session_state["session_id"] = new_id
-    return new_id
+    return sid
 
 
 # === MEMORY MANAGEMENT (FIX MEMORY LEAK) ===
@@ -1931,13 +2137,13 @@ def trim_session_messages():
         current_count = len(st.session_state.messages)
 
         if current_count > MAX_MESSAGES_IN_MEMORY:
-            excess = current_count - MAX_MESSAGES_IN_MEMORY
-            first_msg = st.session_state.messages[0] if st.session_state.messages else None
-            st.session_state.messages = st.session_state.messages[excess:]
-            # Re-inserează primul mesaj dacă nu e deja prezent (context inițial)
-            if first_msg and (not st.session_state.messages or st.session_state.messages[0] != first_msg):
-                st.session_state.messages.insert(0, first_msg)
-            st.toast(f"📝 Am arhivat {excess} mesaje vechi pentru performanță.", icon="📦")
+            msgs = st.session_state.messages
+            # Păstrăm primul mesaj + ultimele (MAX-1) => exact MAX (înainte rămâneau MAX+1,
+            # deci se re-tăia și apărea toast-ul la fiecare mesaj nou).
+            st.session_state.messages = [msgs[0]] + msgs[-(MAX_MESSAGES_IN_MEMORY - 1):]
+            if not st.session_state.get("_trim_notified"):
+                st.session_state["_trim_notified"] = True
+                st.toast("📝 Conversația e lungă: mesajele vechi au fost arhivate pentru performanță.", icon="📦")
 
 
 def summarize_conversation(messages: list) -> str | None:
@@ -2050,10 +2256,14 @@ def save_message_with_limits(session_id: str, role: str, content: str):
     save_message_to_db(session_id, role, content)
     invalidate_session_cache()  # FIX: un mesaj nou înseamnă date noi în sidebar
     
-    # Rulează trim în același thread — Streamlit nu e thread-safe
-    # Rulăm la fiecare 50 mesaje pentru a nu bloca UI-ul la fiecare salvare
-    if len(st.session_state.get("messages", [])) % 50 == 0:
+    # Rulează trim în același thread — Streamlit nu e thread-safe.
+    # Contor de salvări (nu len(messages) % 50: lista e plafonată la MAX_MESSAGES_IN_MEMORY,
+    # deci condiția devenea adevărată la FIECARE mesaj odată ajuns la plafon).
+    _saves = st.session_state.get("_db_saves_since_trim", 0) + 1
+    if _saves >= 50:
         trim_db_messages(session_id)
+        _saves = 0
+    st.session_state["_db_saves_since_trim"] = _saves
     
     trim_session_messages()
 
@@ -2135,7 +2345,7 @@ def repair_svg(svg_content: str) -> str:
 
     if 'xmlns=' not in svg_content:
         svg_content = svg_content.replace('<svg', '<svg xmlns="http://www.w3.org/2000/svg"', 1)
-    if 'viewBox=' not in svg_content.lower():
+    if 'viewbox=' not in svg_content.lower():
         svg_content = svg_content.replace('<svg', '<svg viewBox="0 0 800 600"', 1)
 
     # Pasul 2: repară cu lxml dacă e disponibil
@@ -2175,7 +2385,7 @@ def validate_svg(svg_content: str) -> tuple:
 
     if _LXML_AVAILABLE:
         try:
-            parser = _lxml_etree.XMLParser(recover=True)
+            parser = _lxml_etree.XMLParser(recover=True, resolve_entities=False, no_network=True)
             tree = _lxml_etree.fromstring(svg_content.encode("utf-8"), parser)
             has_content = any(f'<{el}' in svg_content.lower() for el in visual_elements)
             if not has_content:
@@ -2236,6 +2446,41 @@ def _is_gfile_active(gfile) -> bool:
     return state_str in ("FileState.ACTIVE", "ACTIVE") or state_name == "ACTIVE"
 
 
+def _svg_is_wellformed(svg_content: str) -> bool:
+    """Un SVG afișat ca <img> trebuie să fie XML bine format (browserul nu tolerează erori)."""
+    try:
+        if _LXML_AVAILABLE:
+            _lxml_etree.fromstring(
+                svg_content.encode("utf-8"),
+                _lxml_etree.XMLParser(resolve_entities=False, no_network=True),
+            )
+        else:
+            import xml.etree.ElementTree as _ET
+            _ET.fromstring(svg_content)
+        return True
+    except Exception:
+        return False
+
+
+def _render_svg_as_image(svg_content: str, bg: str):
+    """Afișează SVG-ul ca <img src="data:image/svg+xml;base64,...">.
+
+    În contextul <img> browserul NU execută scripturi și nu încarcă resurse externe,
+    deci un SVG malițios nu poate citi localStorage (cheia API) și nu poate face XSS —
+    indiferent cât de bine sau prost a fost curățat de sanitize_svg().
+    """
+    import base64 as _b64
+    b64 = _b64.b64encode(svg_content.encode("utf-8")).decode("ascii")
+    st.markdown(
+        '<div style="text-align:center;margin:10px 0;">'
+        f'<img alt="Desen" src="data:image/svg+xml;base64,{b64}" '
+        f'style="width:100%;max-width:900px;height:auto;background:{bg};'
+        'border-radius:8px;padding:10px;box-sizing:border-box;"/>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_message_with_svg(content: str):
     """Renderează mesajul cu suport îmbunătățit pentru SVG."""
     has_svg_markers = '[[DESEN_SVG]]' in content
@@ -2272,41 +2517,31 @@ def render_message_with_svg(content: str):
         
         if svg_code:
             svg_code = sanitize_svg(svg_code)
-            svg_code = repair_svg(svg_code)
+            svg_code = repair_svg(svg_code) or ""
             # Injectam <style> direct in SVG dupa primul tag <svg>
-            # Aceasta suprascrie ORICE background/fill alb pus de AI, indiferent de forma
+            # (într-un <img> CSS-ul paginii nu ajunge în SVG, deci culorile se pun aici)
             _dark_svg = st.session_state.get("dark_mode", False)
+            _bg   = "#0e1117" if _dark_svg else "#ffffff"
+            _text = "#fafafa" if _dark_svg else "#1a1a1a"
             _style_inject = (
                 "<style>"
                 "svg{background:transparent!important}"
                 "rect[id='bg'],rect[id='background'],rect.bg,rect.background{display:none!important}"
-                + ("text{fill:#e0e0e0!important}" if _dark_svg else "")
-                + "</style>"
+                f"text{{fill:{_text}!important}}"
+                f"rect[fill='white'],rect[fill='#fff'],rect[fill='#ffffff'],"
+                f"rect[fill='#FFF'],rect[fill='#FFFFFF']{{fill:{_bg}!important}}"
+                "</style>"
             )
-            svg_code = re.sub(r'(<svg[^>]*>)', r'\1' + _style_inject, svg_code, count=1)
+            svg_code = re.sub(r'(<svg[^>]*>)', lambda m: m.group(1) + _style_inject, svg_code, count=1)
             is_valid, error = validate_svg(svg_code)
-            
+            if is_valid and not _svg_is_wellformed(svg_code):
+                is_valid, error = False, "SVG-ul nu e XML valid"
+
             if is_valid:
                 if before_text.strip():
                     st.markdown(before_text.strip())
-                
-                # components.html reda SVG exact, fara sanitizare Streamlit
-                _is_dark = st.session_state.get("dark_mode", False)
-                _bg      = "#0e1117" if _is_dark else "#ffffff"
-                _text    = "#fafafa" if _is_dark else "#1a1a1a"
-                _svg_height = 650
-                components.html(
-                    f'''<style>
-                    html,body{{margin:0;padding:0;background:{_bg};}}
-                    .svg-wrap{{background:{_bg};width:100%;padding:10px 4px;box-sizing:border-box;border-radius:8px;}}
-                    svg{{background:transparent!important;max-width:100%;height:auto;}}
-                    svg text{{fill:{_text}!important;}}
-                    svg rect[fill="white"],svg rect[fill="#fff"],svg rect[fill="#ffffff"]{{fill:{_bg}!important;}}
-                    </style>
-                    <div class="svg-wrap">{svg_code}</div>''',
-                    height=_svg_height,
-                    scrolling=False,
-                )
+
+                _render_svg_as_image(svg_code, _bg)
                 
                 if after_text.strip():
                     st.markdown(after_text.strip())
@@ -2315,77 +2550,44 @@ def render_message_with_svg(content: str):
                 st.warning(f"⚠️ Desenul nu a putut fi afișat corect: {error}")
     
     clean_content = content
-    clean_content = re.sub(r'\[\[DESEN_SVG\]\]', '\n', clean_content)
+    clean_content = re.sub(r'\[\[DESEN_SVG\]\]', '\n🎨 *Desen:*\n', clean_content)
     clean_content = re.sub(r'\[\[/DESEN_SVG\]\]', '\n', clean_content)
     
     st.markdown(clean_content)
 
 
-# === PDF UTILITY — extragere text local pentru documente mari ===
-def _extract_pdf_text_pymupdf(pdf_bytes: bytes, max_chars: int = 80_000) -> str:
-    """
-    Extrage textul dintr-un PDF folosind PyMuPDF (fitz).
-    Util pentru PDF-uri lungi unde trimiterea bruta la Gemini ar depasi limitele.
-    Returneaza textul extras (trunchiat la max_chars) sau string gol la eroare.
-    FIX: mutat înainte de init_db() — funcțiile utilitare aparțin înainte de codul UI.
-    """
-    try:
-        import fitz  # PyMuPDF
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        parts = []
-        total = 0
-        for page_num, page in enumerate(doc, start=1):
-            text = page.get_text("text")
-            if text.strip():
-                parts.append(f"--- Pagina {page_num} ---\n{text.strip()}")
-                total += len(text)
-                if total >= max_chars:
-                    parts.append(f"\n[... continut trunchiat la {max_chars} caractere ...]")
-                    break
-        doc.close()
-        return "\n\n".join(parts)
-    except ImportError:
-        return ""  # PyMuPDF nu e instalat — folosim upload direct la Gemini
-    except Exception:
-        return ""  # orice alta eroare — fallback la upload direct
-
-
-# Pragul (in bytes) de la care folosim PyMuPDF pentru extragere text
-# PDF-uri mai mari de 2 MB sunt procesate local, cele mici merg direct la Gemini
-PDF_PYMUPDF_THRESHOLD_BYTES = 2 * 1024 * 1024  # 2 MB
-
-
 # === INIȚIALIZARE ===
 init_db()
 cleanup_old_sessions(CLEANUP_DAYS_OLD)
+
+# Partea comercială (comercial/): conturi, acord parental, documente legale, abonamente.
+comercial.core.setup(get_client=get_supabase_client, log=_log, send_email=_send_email,
+                      cleanup_days=CLEANUP_DAYS_OLD)
+
+# Documentele legale ca pagini publice (?doc=termeni / ?doc=confidentialitate) — linkate din Stripe și emailuri.
+_doc_public = st.query_params.get("doc", "")
+if _doc_public in comercial.core.LEGAL_VERSIONS:
+    st.markdown(comercial.ui.legal_text(_doc_public))
+    st.stop()
+
+# Linkul din emailul trimis părintelui: pagină separată, fără sesiune de chat.
+_parinte_token = st.query_params.get("parinte", "")
+if _parinte_token:
+    comercial.ui.render_parent_page(_parinte_token)   # se oprește singură (st.stop)
+
+# Citește din browser SID-ul salvat + tokenul de login și restaurează contul (o dată per sesiune)
+load_browser_storage_and_login()
+if comercial.core.billing_on():
+    refresh_current_user()
+
 # Python generează/restaurează SID — poate pune ?sid= în URL pentru JS
 session_id = get_or_create_session_id()
 st.session_state.session_id = session_id
 update_session_activity(session_id)
 
 # JS citește ?sid= din URL (dacă Python l-a pus) și îl salvează în localStorage
-# La revenire după restart: JS citește SID+token din localStorage și face reload cu ?sid=&rmt=
+# La revenire după restart: JS citește SID din localStorage și face reload cu ?sid=
 inject_session_js()
-
-# === RESTAURARE AUTENTIFICARE prin remember token HMAC ===
-# ?rmt= e scris în URL de Python la login și rămâne acolo permanent (ca ?sid=).
-# Supraviețuiește oricărui session_state reset, reconnect WebSocket, restart telefon.
-# Validarea HMAC e instantă (fără Supabase). Query DB se face o singură dată după reset.
-if not st.session_state.get("auth_user_id"):
-    _rmt = st.query_params.get("rmt", "")
-    if _rmt:
-        _rmt_user = _validate_remember_token(_rmt)
-        if _rmt_user:
-            _rmt_user["remember_token"] = _rmt  # păstrăm același token în URL
-            auth_set_session(_rmt_user)
-        else:
-            # Token invalid sau expirat — curățăm din URL
-            try:
-                _p = dict(st.query_params)
-                _p.pop("rmt", None)
-                st.query_params.update(_p)
-            except Exception:
-                pass
 
 
 # === API KEYS ===
@@ -2402,6 +2604,22 @@ if not st.session_state.get("auth_user_id"):
 # ── Pasul 1: citește cheia elevului din session_state (salvată direct, fără URL)
 # FIX 1: cheia NU mai vine prin ?apikey= în URL — e salvată direct în session_state
 # la click pe "Salvează cheia" și persistată în localStorage de JS via _saveApiKeyToStorage()
+# Restaurăm cheia din localStorage (o singură dată pe sesiune Streamlit) și executăm
+# comenzile save/clear trimise de butoanele din sidebar. Doar dacă nu ai chei în secrets.
+_has_owner_keys = ("GOOGLE_API_KEYS" in st.secrets) or ("GOOGLE_API_KEY" in st.secrets)
+_kb_cmd = st.session_state.pop("_kb_cmd", None)
+if _key_bridge is not None and not _has_owner_keys:
+    _kb_val = _key_bridge(cmd=_kb_cmd, key="_kb_bridge", default=None)
+    if _kb_val is not None and not st.session_state.get("_kb_synced"):
+        st.session_state["_kb_synced"] = True
+        if (
+            isinstance(_kb_val, str)
+            and 15 <= len(_kb_val) <= 200
+            and not any(ch.isspace() for ch in _kb_val)
+            and not st.session_state.get("_manual_api_key")
+        ):
+            st.session_state["_manual_api_key"] = _kb_val
+
 saved_manual_key = st.session_state.get("_manual_api_key", "")
 
 # ── Pasul 2: construiește lista de chei (secrets + manuală) ──
@@ -2435,18 +2653,233 @@ if raw_keys_secrets:
                 if clean_k:
                     keys.append(clean_k)
 
-# Adaugă cheia elevului la final (folosită când celelalte se epuizează)
+# Cheile salvate în contul elevului (mama, tata, rude...) — rotite automat când se epuizează
+_acct_items = acct_keys_load() if current_user() else []
+for _it in _acct_items:
+    if _it["key"] not in keys:
+        keys.append(_it["key"])
+
+# Adaugă cheia elevului salvată doar în browser (folosită când celelalte se epuizează)
 if saved_manual_key and saved_manual_key not in keys:
     keys.append(saved_manual_key)
 
 # ── Pasul 3: UI în sidebar pentru cheia manuală ──
 # Afișăm secțiunea DOAR dacă nu există chei configurate în secrets
-_are_secrets_keys = len([k for k in keys if k != saved_manual_key]) > 0
+def _render_account_ui():
+    """Secțiunea „👤 Cont” din bara laterală (login, cont nou, resetare parolă, ieșire)."""
+    # --- Cont (opțional) ---
+    _user = current_user()
+    if _user:
+        st.markdown(f"👤 **{_user['name']}**  \n<small>{_user['email']}</small>", unsafe_allow_html=True)
+        st.caption("Conversațiile tale sunt salvate în cont și apar pe orice dispozitiv.")
+        _rec_show = st.session_state.get("_auth_new_recovery")
+        if _rec_show:
+            st.warning("🔑 **Codul tău de recuperare** — notează-l! Cu el îți poți reseta parola "
+                       "dacă o uiți. Îl vezi doar acum.", icon="⚠️")
+            st.code(_rec_show, language=None)
+            st.download_button("⬇️ Salvează codul (.txt)", key="_rec_dl",
+                               data=(f"Profesor Liceu — cod de recuperare\nCont: {_user['email']}\n"
+                                     f"Cod: {_rec_show}\n").encode("utf-8"),
+                               file_name="profesor_liceu_cod_recuperare.txt", use_container_width=True)
+            st.button("✅ Am notat codul", key="_rec_ok", on_click=_dismiss_recovery, use_container_width=True)
+        else:
+            with st.expander("🔑 Cod de recuperare", expanded=False):
+                st.caption("Dacă nu mai ai codul de recuperare, generează unul nou "
+                           "(cel vechi nu va mai funcționa).")
+                if st.button("Generează cod nou", key="_rec_new", use_container_width=True):
+                    if not auth_regenerate_recovery():
+                        st.error("Nu am putut genera codul acum.")
+                    st.rerun()
+        _pf = st.session_state.pop("_auth_parent_flash", None)
+        if _pf:
+            (st.success if _pf[0] else st.error)(_pf[1])
+        comercial.ui.render_profile_form(_user, globals().get("PROFILE_BAC", {}))
+        comercial.ui.render_subscription(_user)
+        comercial.ui.render_privacy_tools(
+            _user,
+            verify_password=lambda _em, _pw: auth_login(_em, _pw)[0] is not None,
+            after_delete=lambda: auth_logout(),
+        )
+        comercial.ui.render_admin_panel(_user)
+        _lo1, _lo2 = st.columns(2)
+        with _lo1:
+            if st.button("🚪 Ieșire", key="_auth_logout", use_container_width=True):
+                auth_logout()
+                st.rerun()
+        with _lo2:
+            if st.button("Ieșire peste tot", key="_auth_logout_all", use_container_width=True,
+                         help="Deconectează contul de pe toate dispozitivele"):
+                auth_logout(all_devices=True)
+                st.rerun()
+    else:
+        with st.expander("👤 Cont — conversațiile tale pe orice dispozitiv", expanded=False):
+            _tab_in, _tab_new, _tab_reset = st.tabs(["Intră în cont", "Cont nou", "Am uitat parola"])
+            with _tab_in:
+                with st.form("_auth_login_form", clear_on_submit=False):
+                    _le = st.text_input("Email", key="_auth_login_email", autocomplete="email")
+                    _lp = st.text_input("Parolă", type="password", key="_auth_login_pw",
+                                        autocomplete="current-password")
+                    _lr = st.checkbox("Ține-mă minte pe acest dispozitiv", value=True, key="_auth_login_rem")
+                    if st.form_submit_button("Intră", type="primary", use_container_width=True):
+                        _u, _err = auth_login(_le, _lp)
+                        if _u:
+                            auth_complete_login(_u, _lr)
+                            st.rerun()
+                        else:
+                            st.error(_err)
+            with _tab_new:
+                _strict = comercial.core.billing_on()
+                if _strict:
+                    comercial.ui.render_legal_links("_reg_legal")
+                with st.form("_auth_register_form", clear_on_submit=False):
+                    _rn = st.text_input("Nume (opțional)", key="_auth_reg_name", max_chars=60)
+                    _re_ = st.text_input("Email", key="_auth_reg_email", autocomplete="email")
+                    _rp = st.text_input(f"Parolă (minim {AUTH_MIN_PASSWORD} caractere)", type="password",
+                                        key="_auth_reg_pw", autocomplete="new-password")
+                    _rp2 = st.text_input("Repetă parola", type="password", key="_auth_reg_pw2",
+                                         autocomplete="new-password")
+                    _by = _bm = None
+                    _pe, _acc = "", False
+                    if _strict:
+                        _yr = time.localtime().tm_year
+                        _c1, _c2 = st.columns(2)
+                        with _c1:
+                            _by = st.selectbox("Anul nașterii", [None] + list(range(_yr - 10, _yr - 100, -1)),
+                                               key="_auth_reg_by", format_func=lambda x: "— an —" if x is None else str(x))
+                        with _c2:
+                            _bm = st.selectbox("Luna", [None] + list(range(1, 13)), key="_auth_reg_bm",
+                                               format_func=lambda x: "— lună —" if x is None else f"{x:02d}")
+                        _pe = st.text_input("Emailul unui părinte (obligatoriu sub 18 ani)", key="_auth_reg_parent",
+                                            autocomplete="off")
+                        st.caption("Sub 16 ani, contul se activează după acordul părintelui (îi trimitem un link). "
+                                   "Sub 18 ani, abonamentul îl plătește părintele.")
+                        _acc = st.checkbox("Am peste 16 ani, am citit și accept Termenii și condițiile și Politica "
+                                           "de confidențialitate.", key="_auth_reg_terms")
+                    _rr = st.checkbox("Ține-mă minte pe acest dispozitiv", value=True, key="_auth_reg_rem")
+                    st.caption("Conversațiile din acest browser vor fi mutate în contul nou.")
+                    if st.form_submit_button("Creează cont", type="primary", use_container_width=True):
+                        if _rp != _rp2:
+                            st.error("Parolele nu coincid.")
+                        else:
+                            _u, _err = auth_register(_re_, _rp, _rn, _by, _bm, _pe, _acc)
+                            if _u:
+                                auth_complete_login(_u, _rr)
+                                st.rerun()
+                            else:
+                                st.error(_err)
+            with _tab_reset:
+                if _smtp_config():
+                    with st.form("_auth_reset_mail_form"):
+                        st.markdown("**1.** Primește un cod pe email")
+                        _rme = st.text_input("Email", key="_auth_reset_mail_email", autocomplete="email")
+                        if st.form_submit_button("📧 Trimite codul", use_container_width=True):
+                            _sent, _msg = auth_request_reset_email(_rme)
+                            (st.success if _sent else st.error)(_msg)
+                    st.markdown("**2.** Introdu codul din email *sau* codul de recuperare")
+                else:
+                    st.caption("Introdu codul de recuperare primit la crearea contului.")
+                with st.form("_auth_reset_form"):
+                    _xe = st.text_input("Email", key="_auth_reset_email", autocomplete="email")
+                    _xc = st.text_input("Cod (6 cifre din email sau XXXX-XXXX-XXXX)", key="_auth_reset_code")
+                    _xp = st.text_input(f"Parolă nouă (minim {AUTH_MIN_PASSWORD} caractere)", type="password",
+                                        key="_auth_reset_pw", autocomplete="new-password")
+                    _xp2 = st.text_input("Repetă parola nouă", type="password", key="_auth_reset_pw2",
+                                         autocomplete="new-password")
+                    if st.form_submit_button("Schimbă parola", type="primary", use_container_width=True):
+                        if _xp != _xp2:
+                            st.error("Parolele nu coincid.")
+                        else:
+                            _u, _err = auth_reset_password(_xe, _xc, _xp)
+                            if _u:
+                                auth_complete_login(_u, True)
+                                st.toast("✅ Parola a fost schimbată. Celelalte dispozitive au fost deconectate.",
+                                         icon="🔑")
+                                st.rerun()
+                            else:
+                                st.error(_err)
+
+
+_acct_key_set = {it["key"] for it in _acct_items}
+_are_secrets_keys = len([k for k in keys if k != saved_manual_key and k not in _acct_key_set]) > 0
+
+_KEY_GUIDE_MD = """
+**Pasul 1** — Deschide Google AI Studio (butonul de mai sus) și autentifică-te cu contul Google.
+
+**Pasul 2** — Apasă **"Create API key"** (buton albastru); dacă ți se cere, alege **"Create API key in new project"**.
+
+**Pasul 3** — Copiază cheia afișată (`AIzaSy...` sau `AQ.Ab8R...`) și lipește-o mai jos.
+
+💡 Fiecare cont Google are cota lui gratuită (cereri pe minut și pe zi). Cu chei din mai multe conturi
+(ex. de la părinți sau rude care nu le folosesc) ai de atâtea ori mai multe întrebări pe zi.
+"""
+
+
+def _render_account_keys_ui():
+    """Cheile din cont: listă cu 🗑️ + formular de adăugare (vizibil doar pentru utilizatorii logați)."""
+    st.subheader("🔑 Cheile tale API Google AI")
+    items = acct_keys_load()
+    if items:
+        st.caption(f"{len(items)} {'cheie salvată' if len(items) == 1 else 'chei salvate'} în cont, pe orice dispozitiv. "
+                   "Când una își termină cota, trece automat la următoarea.")
+        for it in items:
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(f"🔑 **{it['label']}** · <small>…{it['hint']}</small>", unsafe_allow_html=True)
+            with c2:
+                st.button("🗑️", key=f"_acct_key_del_{it['id']}", help=f"Șterge cheia „{it['label']}”",
+                          on_click=acct_key_delete, args=(it["id"],))
+    else:
+        st.caption("Nu ai încă nicio cheie salvată în cont.")
+
+    if saved_manual_key and saved_manual_key not in _acct_key_set and len(items) < MAX_ACCOUNT_KEYS:
+        st.info("Ai o cheie salvată doar în acest browser.")
+        if st.button("☁️ Mut-o în cont", key="_acct_key_move", use_container_width=True):
+            _ok, _note = acct_key_add("Cheia mea", saved_manual_key)
+            if _ok:
+                st.session_state.pop("_manual_api_key", None)
+                st.session_state["_kb_synced"] = True
+                st.session_state["_kb_cmd"] = {"op": "clear", "n": secrets.token_hex(4)}
+                st.rerun()
+            else:
+                st.error(_note)
+
+    if len(items) < MAX_ACCOUNT_KEYS:
+        with st.expander("➕ Adaugă o cheie", expanded=not items and not saved_manual_key):
+            st.link_button("🌐 Ia o cheie gratuită din Google AI Studio", "https://aistudio.google.com/apikey",
+                           use_container_width=True)
+            with st.popover("❓ Cum obțin o cheie?", use_container_width=True):
+                st.markdown(_KEY_GUIDE_MD)
+            _key_photo_reader("_acct_key_value", _ocr_keys_available(keys))
+            _key_photo_message("_acct_key_value")
+            with st.form("_acct_key_add_form", clear_on_submit=True):
+                _lbl = st.text_input("Al cui cont Google e cheia?", placeholder="ex: Mama, Tata, Bunicul",
+                                     max_chars=40, key="_acct_key_label")
+                _val = st.text_input("Cheia API", type="password", placeholder="AIzaSy... sau AQ.Ab8R...",
+                                     key="_acct_key_value",
+                                     help="Lipește cheia sau folosește poza de mai sus — se completează singură.")
+                if st.form_submit_button("✅ Adaugă în cont", type="primary", use_container_width=True):
+                    _ok, _note = acct_key_add(_lbl, _val)
+                    if _ok:
+                        st.session_state["_acct_key_flash"] = ("ok", _note or "✅ Cheie adăugată în cont.")
+                        st.rerun()
+                    else:
+                        st.error(_note)
+    _flash = st.session_state.pop("_acct_key_flash", None)
+    if _flash:
+        (st.success if _flash[0] == "ok" else st.warning)(_flash[1])
+
 
 with st.sidebar:
-    if not _are_secrets_keys:
+    if comercial.core.billing_on():
+        pass   # versiunea comercială folosește doar cheile proiectului plătit (nu chei ale elevilor)
+    elif current_user():
+        st.divider()
+        _render_account_keys_ui()
+    elif not _are_secrets_keys:
         st.divider()
         st.subheader("🔑 Cheie API Google AI")
+        st.caption("💡 Cu un cont (👤 Cont, mai sus) poți salva mai multe chei — de exemplu de la părinți — "
+                   "și le ai pe orice dispozitiv.")
 
         if not saved_manual_key:
             # ── Ghid vizual — vizibil DOAR când nu există cheie salvată ──
@@ -2461,43 +2894,55 @@ with st.sidebar:
                 st.markdown("""
 **Pasul 2** — Autentifică-te cu contul Google.
 
-**Pasul 3** — Apasă **"Create API key"** (dreapta sus).
+**Pasul 3** — Apasă **"Create API key"** (buton albastru).
 
 **Pasul 4** — Dacă ți se cere, alege **"Create API key in new project"**.
 
 **Pasul 5** — Copiază cheia afișată.
-- Arată astfel: `AIzaSy...` (39 caractere)
+- Poate arăta astfel: `AIzaSy...` (format vechi) sau `AQ.Ab8R...` (format nou Google)
 - Apasă iconița 📋 de lângă cheie
 
 **Pasul 6** — Lipește cheia mai jos și apasă **Salvează**.
 
 ---
-💡 **Limită gratuită:** 15 cereri/minut, 1 milion tokeni/zi — suficient pentru teme și exerciții.
+💡 **Limită gratuită:** depinde de model și se aplică per proiect Google (cereri pe minut și pe zi); o vezi în Google AI Studio. De obicei e suficientă pentru teme și exerciții.
                 """)
 
             # ── Câmpul de input și butonul de salvare ──
             st.caption("Cheia se salvează în browserul tău și rămâne activă după refresh.")
+            _key_photo_reader("_manual_key_input", _ocr_keys_available(keys))
+            _key_photo_message("_manual_key_input")
             new_key = st.text_input(
                 "Cheie API Google AI:",
                 type="password",
-                placeholder="AIzaSy...",
+                placeholder="AIzaSy... sau AQ.Ab8R...",
                 label_visibility="collapsed",
+                key="_manual_key_input",
             )
             if st.button("✅ Salvează cheia", use_container_width=True, type="primary", key="save_api_key"):
                 clean = new_key.strip().strip('"').strip("'")
-                if clean and clean.startswith("AIza") and len(clean) > 20:
+                # FIX FORMAT CHEIE: Google a schimbat formatul cheilor API (vechi: "AIza...",
+                # nou: "AQ.Ab8R..."), iar validarea veche bloca cheile noi. Acum acceptăm
+                # ORICE format de cheie — nu mai verificăm un prefix fix, doar reguli
+                # minimale de bun-simț: lungime rezonabilă și fără spații/caractere de control
+                # (o cheie API reală nu conține spații).
+                is_plausible_key = (
+                    clean
+                    and 15 <= len(clean) <= 200
+                    and " " not in clean
+                    and "\n" not in clean
+                    and "\t" not in clean
+                )
+                if is_plausible_key:
                     st.session_state["_manual_api_key"] = clean
                     keys.append(clean)
-                    # FIX 1: salvăm direct în localStorage via JS — cheia NU mai apare în URL
-                    components.html(
-                        f"<script>window.parent._saveApiKeyToStorage && "
-                        f"window.parent._saveApiKeyToStorage({json.dumps(clean)});</script>",
-                        height=0
-                    )
+                    # Salvăm în localStorage prin podul key_bridge (rulează la rerun-ul de mai jos)
+                    st.session_state["_kb_synced"] = True
+                    st.session_state["_kb_cmd"] = {"op": "save", "key": clean, "n": secrets.token_hex(4)}
                     st.toast("✅ Cheie salvată în browser!", icon="🔑")
                     st.rerun()
                 else:
-                    st.error("❌ Cheie invalidă. Trebuie să înceapă cu 'AIza' și să aibă minim 20 caractere.")
+                    st.error("❌ Cheie invalidă. Verifică să nu conțină spații și să aibă minim 15 caractere.")
 
         else:
             # Cheia e salvată — arată doar statusul și butonul de ștergere, fără ghid
@@ -2506,17 +2951,26 @@ with st.sidebar:
             if st.button("🗑️ Șterge cheia", use_container_width=True, key="del_api_key"):
                 st.session_state.pop("_manual_api_key", None)
                 st.query_params.pop("apikey", None)
-                # FIX 5: folosim components importat la nivel de modul
-                components.html("<script>localStorage.removeItem('profesor_api_key');</script>", height=0)
+                st.session_state["_kb_synced"] = True
+                st.session_state["_kb_cmd"] = {"op": "clear", "n": secrets.token_hex(4)}
                 st.rerun()
 
 if not keys:
-    st.error("❌ Nicio cheie API validă. Introdu cheia ta Google AI în bara laterală.")
+    # Fără cheie: lăsăm totuși login-ul disponibil — elevul își poate recupera cheile din cont.
+    with st.sidebar:
+        st.divider()
+        _render_account_ui()
+    st.error("❌ Nicio cheie API validă. Introdu cheia ta Google AI în bara laterală "
+             "sau intră în cont (👤 Cont) dacă ți-ai salvat cheile acolo.")
     st.stop()
 
 if "key_index" not in st.session_state:
-    # Distribuie utilizatorii aleator între chei — nu toți pe cheia 0
-    st.session_state.key_index = random.randint(0, max(len(keys) - 1, 0))
+    # FIX 4: distribuție uniformă bazată pe hash-ul SID-ului, nu random.randint.
+    # random.randint independent per sesiune nu garantează echilibru când 100 de elevi
+    # deschid simultan — toți pot nimeri pe aceeași cheie prin coincidență.
+    # hash(session_id) % len(keys) distribuie determinist și uniform pe chei.
+    _num_keys = max(len(keys), 1)
+    st.session_state.key_index = int(hashlib.md5(session_id.encode()).hexdigest(), 16) % _num_keys
 # Salvăm lista de chei în session_state — necesară pentru _cleanup_gfiles la switch sesiune
 st.session_state["_api_keys_list"] = keys
 
@@ -4395,8 +4849,7 @@ _PROMPT_ALL_SUBJECTS = "\n    GHID DE COMPORTAMENT:\n" + "".join(_PROMPT_SUBJECT
 
 
 def get_system_prompt(materie: str | None = None, pas_cu_pas: bool = False,
-                      mod_strategie: bool = False, mod_bac_intensiv: bool = False, mod_avansat: bool = False,
-) -> str:
+                      mod_strategie: bool = False, mod_bac_intensiv: bool = False, mod_avansat: bool = False) -> str:
     """Returnează System Prompt adaptat materiei selectate și modurilor active.
     
     OPTIMIZARE TOKEN: când materia e selectată explicit, include DOAR blocul acelei materii
@@ -4572,8 +5025,7 @@ def get_system_prompt(materie: str | None = None, pas_cu_pas: bool = False,
             + mod_avansat_bloc
             + _PROMPT_COMUN
             + ghid_materie
-            + _PROMPT_FINAL
-            + get_student_profile_context())
+            + _PROMPT_FINAL)
 
 
 
@@ -4583,7 +5035,8 @@ SYSTEM_PROMPT = get_system_prompt(
     pas_cu_pas=st.session_state.get("pas_cu_pas", False),
     mod_avansat=st.session_state.get("mod_avansat", False),
     mod_strategie=st.session_state.get("mod_strategie", False),
-    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+)
 
 
 # === DETECȚIE AUTOMATĂ MATERIE ===
@@ -4827,7 +5280,6 @@ _STRONG_INDICATORS = {
     ],
 }
 
-@st.cache_data(max_entries=200, show_spinner=False)
 def detect_subject_from_text(text: str) -> str | None:
     """Detectează materia dintr-un text folosind cuvinte cheie cu sistem de ponderi.
     
@@ -4898,7 +5350,8 @@ def update_system_prompt_for_subject(materie: str | None):
         pas_cu_pas=st.session_state.get("pas_cu_pas", False),
         mod_avansat=st.session_state.get("mod_avansat", False),
         mod_strategie=st.session_state.get("mod_strategie", False),
-        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+    )
 
 
 
@@ -4930,7 +5383,7 @@ MATERII_BAC = {
             "S3": "2 probleme (funcții+derivate, integrale/limite) = 30p",
         },
     },
-    "⚡ Fizică Tehnologic": {
+    "⚡ Fizică tehnologic": {
         "cod": "fizica_tehnologic",
         "profile": ["Filiera tehnologică"],
         "subiecte": ["Mecanică", "Termodinamică", "Curent continuu", "Optică"],
@@ -5047,7 +5500,7 @@ MATERII_BAC = {
             "S3": "Problemă complexă de programare (30p)",
         },
     },
-    "⚡ Fizică Real": {
+    "🔬 Fizică real": {
         "cod": "fizica_real",
         "profile": ["Matematică-Informatică", "Științe ale naturii"],
         "subiecte": ["Mecanică", "Termodinamică", "Electromagnetism", "Optică", "Fizică modernă"],
@@ -5093,12 +5546,12 @@ PROFILE_BAC = {
         "📐 Profil real": {
             "Matematică-Informatică": {
                 "materii_obligatorii": ["📐 Matematică M1", "📖 Română real/tehn"],
-                "materii_optionale": ["💻 Informatică", "⚡ Fizică Real", "🧪 Chimie", "🧬 Biologie"],
+                "materii_optionale": ["💻 Informatică", "🔬 Fizică real", "🧪 Chimie", "🧬 Biologie"],
                 "descriere": "Matematică M1 + o disciplină la alegere din arie"
             },
             "Științe ale naturii": {
                 "materii_obligatorii": ["📐 Matematică M2", "📖 Română real/tehn"],
-                "materii_optionale": ["⚡ Fizică Real", "🧪 Chimie", "🧬 Biologie"],
+                "materii_optionale": ["🔬 Fizică real", "🧪 Chimie", "🧬 Biologie"],
                 "descriere": "Matematică M2 + Fizică sau Chimie sau Biologie"
             },
         },
@@ -5118,13 +5571,13 @@ PROFILE_BAC = {
     "🛠️ Filiera tehnologică": {
         "⚙️ Profil tehnic": {
             "Tehnic": {
-                "materii_obligatorii": ["📖 Română real/tehn", "⚡ Fizică Tehnologic"],
+                "materii_obligatorii": ["📖 Română real/tehn", "⚡ Fizică tehnologic"],
                 "materii_optionale": ["📐 Matematică M2", "🧪 Chimie", "💻 Informatică"],
                 "descriere": "Română + Fizică + o disciplină de specialitate"
             },
             "Resurse naturale și protecția mediului": {
                 "materii_obligatorii": ["📖 Română real/tehn", "🧪 Chimie"],
-                "materii_optionale": ["📐 Matematică M2", "🧬 Biologie", "⚡ Fizică Tehnologic"],
+                "materii_optionale": ["📐 Matematică M2", "🧬 Biologie", "⚡ Fizică tehnologic"],
                 "descriere": "Română + Chimie sau Biologie"
             },
         },
@@ -5198,99 +5651,18 @@ PROFILE_BAC = {
         "🪖 Profil militar": {
             "Matematică-Informatică (militar)": {
                 "materii_obligatorii": ["📐 Matematică M1", "📖 Română real/tehn"],
-                "materii_optionale": ["💻 Informatică", "⚡ Fizică Real"],
+                "materii_optionale": ["💻 Informatică", "🔬 Fizică real"],
                 "descriere": "Profil real cu specific militar"
             },
         },
     },
 }
 
-# ── Mapare: chei din PROFILE_BAC (materii_obligatorii/optionale) → chei din MATERII (sidebar) ──
-# PROFILE_BAC folosește denumiri detaliate (ex: "📐 Matematică M1")
-# MATERII folosește denumiri scurte (ex: "📐 Matematică")
-# Fără această mapare, filtrarea selectorului de materii nu funcționează.
-_PROFILE_BAC_TO_MATERII = {
-    # Matematică
-    "📐 Matematică M1":         "📐 Matematică",
-    "📐 Matematică M2":         "📐 Matematică",
-    # Română
-    "📖 Română real/tehn":      "📖 Română",
-    "📖 Română uman/ped":       "📖 Română",
-    # Fizică
-    "⚡ Fizică Real":            "⚡ Fizică Real",
-    "⚡ Fizică Tehnologic":     "⚡ Fizică Tehnologic",
-    "⚡ Fizică tehnologică":    "⚡ Fizică Tehnologic",
-    "⚡ Fizică tehnolog":       "⚡ Fizică Tehnologic",
-    # Celelalte — same key
-    "💻 Informatică":           "💻 Informatică",
-    "🧪 Chimie":                "🧪 Chimie",
-    "🧬 Biologie":              "🧬 Biologie",
-    "🌍 Geografie":             "🌍 Geografie",
-    "🏛️ Istorie":               "🏛️ Istorie",
-    "⚖️ Economie":              "⚖️ Economie",
-    "🧠 Psihologie":            "🧠 Psihologie",
-    "🧠 Logică și argumentare": "🧠 Logică și argumentare",
-    "🇫🇷 Franceză":             "🇫🇷 Franceză",
-    "🇬🇧 Engleză":              "🇬🇧 Engleză",
-    "🇩🇪 Germană":              "🇩🇪 Germană",
-}
-
-
-def get_materii_for_profile() -> list[str]:
-    """
-    Returnează lista de chei din MATERII corespunzătoare profilului elevului autentificat.
-    Folosită pentru a filtra selectorul de materii din sidebar.
-    Returnează [] dacă elevul nu are profil sau nu e autentificat.
-    """
-    if not auth_is_logged_in():
-        return []
-
-    filiera  = st.session_state.get("auth_filiera", "")
-    profil   = st.session_state.get("auth_profil_liceu", "")
-    spec     = st.session_state.get("auth_specializare", "")
-    saved    = st.session_state.get("auth_materii") or []
-
-    materii_set = set()
-    _are_profil_complet = bool(filiera and profil and spec)
-
-    # FIX Bug 2: când profilul e complet, definim ce materii sunt compatibile cu profilul.
-    # Fizică Real e pentru filiera teoretică/vocatională, Fizică Tehnologic e DOAR pentru
-    # filiera tehnologică. Astfel evităm afișarea Fizică Tehnologic la Mate-Info și invers.
-    _materii_incompatibile = set()
-    if _are_profil_complet:
-        _este_tehnologic = "tehnolog" in filiera.lower()
-        if _este_tehnologic:
-            _materii_incompatibile.add("⚡ Fizică Real")
-        else:
-            _materii_incompatibile.add("⚡ Fizică Tehnologic")
-
-    # Din programa specializării
-    if _are_profil_complet:
-        _pb = globals().get("PROFILE_BAC", {})
-        spec_data = _pb.get(filiera, {}).get(profil, {}).get(spec, {})
-        toate = spec_data.get("materii_obligatorii", []) + spec_data.get("materii_optionale", [])
-        for m in toate:
-            mapped = _PROFILE_BAC_TO_MATERII.get(m)
-            if mapped and mapped not in _materii_incompatibile:
-                materii_set.add(mapped)
-
-    # Din materiile salvate manual (pot fi în formatul MATERII direct)
-    # Dacă profilul e complet, excludem materiile incompatibile cu profilul (ex: Fizică Tehnologic
-    # salvată înainte ca utilizatorul să-și seteze profilul teoretic)
-    for m in saved:
-        if m in MATERII:  # deja cheie din MATERII
-            if m not in _materii_incompatibile:
-                materii_set.add(m)
-        else:
-            mapped = _PROFILE_BAC_TO_MATERII.get(m)
-            if mapped and mapped not in _materii_incompatibile:
-                materii_set.add(mapped)
-
-    return list(materii_set)
+# ── Materii disponibile la simulare (cu suport AI) ──────────────────────────
 MATERII_SIMULARE_DISPONIBILE = {
     "📐 Matematică M1", "📐 Matematică M2",
     "📖 Română real/tehn", "📖 Română uman/ped",
-    "⚡ Fizică Tehnologic", "⚡ Fizică Real",
+    "⚡ Fizică tehnologic", "🔬 Fizică real",
     "🧪 Chimie", "🧬 Biologie",
     "🏛️ Istorie", "🌍 Geografie",
     "💻 Informatică", "⚖️ Economie",
@@ -5870,23 +6242,27 @@ BAC_DATE_REALE = {
 
 
 
-def extract_text_from_photo(image_bytes: bytes, materie_label: str) -> str:
+def extract_text_from_photo(image_bytes: bytes, materie_label: str, mime_type: str = "image/jpeg") -> str:
     """Extrage textul scris de mână dintr-o fotografie folosind Gemini Vision.
     
     Folosește Google Files API (upload real) în loc de base64 inline —
     același mecanism ca în sidebar, pentru analiză vizuală completă.
     """
     try:
+        _pk = _pick_key_and_model(MODEL_CHAIN)
+        if _pk:
+            st.session_state.key_index = _pk[0]
         key = keys[st.session_state.get("key_index", 0)]
-        gemini_client = get_gemini_client(key)
+        gemini_client = genai.Client(api_key=key)
 
         # FIX bug 1: upload-ul fișierului e mutat ÎNĂUNTRUL contextului with —
         # tmp_path există garantat când îl folosim, TemporaryDirectory îl curăță după ieșire
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = os.path.join(tmpdir, "upload.jpg")
+            _ext = {"image/png": ".png", "image/webp": ".webp", "image/heic": ".heic", "image/heif": ".heif"}.get(mime_type, ".jpg")
+            tmp_path = os.path.join(tmpdir, "upload" + _ext)
             with open(tmp_path, "wb") as tmp:
                 tmp.write(image_bytes)
-            gfile = gemini_client.files.upload(file=tmp_path, config=genai_types.UploadFileConfig(mime_type="image/jpeg"))
+            gfile = gemini_client.files.upload(file=tmp_path, config=genai_types.UploadFileConfig(mime_type=mime_type))
         # Fișierul temporar a fost șters de TemporaryDirectory; gfile (referința Google) rămâne validă
 
         poll = 0
@@ -5894,13 +6270,13 @@ def extract_text_from_photo(image_bytes: bytes, materie_label: str) -> str:
         while str(gfile.state) in ("FileState.PROCESSING", "PROCESSING") and poll < 30:
             _ocr_status.caption(f"\u23f3 Procesare imagine Google ({poll + 1}s)...")
             time.sleep(1)
-            gfile = gemini_client.files.get(gfile.name)
+            gfile = gemini_client.files.get(name=gfile.name)
             poll += 1
         _ocr_status.empty()
 
         if not _is_gfile_active(gfile):
             try:
-                gemini_client.files.delete(gfile.name)
+                gemini_client.files.delete(name=gfile.name)
             except Exception:
                 pass
             return "[Eroare: imaginea nu a putut fi procesată de Google]"
@@ -5912,21 +6288,28 @@ def extract_text_from_photo(image_bytes: bytes, materie_label: str) -> str:
             f"Dacă un cuvânt e greu de citit, transcrie-l cu [?]. "
             f"Nu adăuga nimic, nu corecta nimic — transcrie fidel."
         )
+        # Prin rotație: dacă modelul/cheia e epuizată, trece automat pe următoarele
+        # (octeții pozei sunt păstrați ca imaginea să poată fi re-urcată pe altă cheie/proiect).
+        _gsrc = st.session_state.get("_gsrc_map") or {}
+        _gsrc[gfile.name] = (image_bytes, mime_type)
+        st.session_state["_gsrc_map"] = _gsrc
         try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=[gfile, prompt]
-            )
-            return response.text.strip()
+            text = "".join(run_chat_with_rotation(
+                [], [gfile, prompt],
+                system_prompt="Transcrii fidel textul din imagini. Răspunzi doar cu textul transcris.",
+                use_cache=False,
+            ))
+            return text.strip()
         finally:
-            # Curăță fișierul de pe Google indiferent de rezultat (succes sau eroare)
             try:
-                gemini_client.files.delete(gfile.name)
+                genai.Client(api_key=keys[st.session_state.get("key_index", 0)]).files.delete(name=gfile.name)
             except Exception:
                 pass
+            _gsrc.pop(gfile.name, None)
 
     except Exception as e:
-        return f"[Eroare la citirea pozei: {e}]"
+        _log("Eroare OCR poză", "silent", e)
+        return "[Eroare la citirea pozei]"
 
 
 def get_bac_prompt_ai(materie_label, materie_info, profil):
@@ -6285,39 +6668,110 @@ def get_bac_prompt_ai(materie_label, materie_info, profil):
     elif cod == "economie":
         return (
             f"Generează un subiect COMPLET de BAC la Economie — {profil}, "
-            f"la nivel examen național România.\n\n"
-            f"STRUCTURĂ:\n"
-            f"SUBIECTUL I (30p) — itemi grilă și semiobiectivi: piață, cerere/ofertă, prețuri, agenți economici\n"
-            f"SUBIECTUL al II-lea (30p) — studiu de caz economic + întrebări structurate\n"
-            f"SUBIECTUL al III-lea (30p) — eseu economic: macroeconomie, șomaj, inflație, PIB, comerț exterior\n"
-            f"10p din oficiu.\n\n"
-            f"[[BAREM_BAC]]\nSUBIECTUL I: [răspunsuri]\nSUBIECTUL al II-lea: [soluții]\nSUBIECTUL al III-lea: [repere eseu]\n[[/BAREM_BAC]]"
+            f"IDENTIC ca structură și dificultate cu subiectele oficiale din România 2021–2025.\n\n"
+            f"STRUCTURĂ EXACTĂ (obligatorie):\n\n"
+            f"SUBIECTUL I (30 puncte) — Itemi obiectivi și semiobiectivi:\n"
+            f"  A. 5 itemi cu alegere multiplă × 4p — piață, cerere, ofertă, prețuri de echilibru, utilitate\n"
+            f"  B. 2 itemi semiobiectivi × 5p — completare definiții, relații economice\n\n"
+            f"SUBIECTUL al II-lea (30 puncte) — Studiu de caz / problemă structurată:\n"
+            f"  - Date numerice realiste (tabel cerere/ofertă SAU venituri/cheltuieli)\n"
+            f"  - 4 cerințe (a, b, c, d): calcule, interpretare grafic, analiză impact politici economice\n"
+            f"  - Include cel puțin o cerință de calcul (elasticitate, profit, cost marginal sau echilibru)\n\n"
+            f"SUBIECTUL al III-lea (30 puncte) — Eseu economic structurat:\n"
+            f"  Alege una dintre temele: șomaj și politici de ocupare / inflație și efecte / PIB și creștere economică /\n"
+            f"  comerț exterior și balanță de plăți / piața muncii / sisteme economice comparate\n"
+            f"  Repere obligatorii în barem:\n"
+            f"    1. Definiție și forme/tipuri ale fenomenului (6p)\n"
+            f"    2. Cauze și efecte economice și sociale (12p)\n"
+            f"    3. Politici economice de intervenție cu exemple concrete (8p)\n"
+            f"    4. Opinie argumentată (4p)\n\n"
+            f"10 puncte din oficiu.\n\n"
+            f"IMPORTANT:\n"
+            f"- Datele numerice trebuie să fie coerente și realiste (ex: prețuri în lei, procente plauzibile)\n"
+            f"- Formulează cerințele exact ca la examen ('Calculați...', 'Precizați...', 'Explicați...')\n"
+            f"- Eseul trebuie să poată fi scris în ~45 minute\n\n"
+            f"[[BAREM_BAC]]\n"
+            f"SUBIECTUL I — A: [răspunsuri corecte cu justificare] B: [răspunsuri complete]\n"
+            f"SUBIECTUL al II-lea: [calcule pas cu pas + răspunsuri la fiecare cerință]\n"
+            f"SUBIECTUL al III-lea: [repere eseu cu punctaj detaliat: conținut 24p + redactare 6p]\n"
+            f"[[/BAREM_BAC]]"
         )
 
     # ── PSIHOLOGIE ──
     elif cod == "psihologie":
         return (
             f"Generează un subiect COMPLET de BAC la Psihologie — {profil}, "
-            f"la nivel examen național România.\n\n"
-            f"STRUCTURĂ:\n"
-            f"SUBIECTUL I (30p) — definiții, caracterizare procese psihice (percepție, memorie, gândire, motivație)\n"
-            f"SUBIECTUL al II-lea (30p) — analiză personalitate: temperament, caracter, aptitudini, aplicații practice\n"
-            f"SUBIECTUL al III-lea (30p) — eseu: psihologie socială sau sănătate mentală\n"
-            f"10p din oficiu.\n\n"
-            f"[[BAREM_BAC]]\nSUBIECTUL I: [răspunsuri]\nSUBIECTUL al II-lea: [soluții]\nSUBIECTUL al III-lea: [repere eseu]\n[[/BAREM_BAC]]"
+            f"IDENTIC ca structură și dificultate cu subiectele oficiale din România 2021–2025.\n\n"
+            f"STRUCTURĂ EXACTĂ (obligatorie):\n\n"
+            f"SUBIECTUL I (30 puncte) — Procese și funcții psihice:\n"
+            f"  A. 4 itemi cu alegere multiplă × 4p — senzații, percepție, memorie, gândire, imaginație, limbaj\n"
+            f"  B. 2 itemi semiobiectivi × 7p — definiții, caracterizare, exemple din viața cotidiană\n\n"
+            f"SUBIECTUL al II-lea (30 puncte) — Personalitate și psihologie aplicată:\n"
+            f"  - Text scurt (100-150 cuvinte) despre o situație / comportament concret\n"
+            f"  - 4 cerințe (a, b, c, d) bazate pe text:\n"
+            f"    a. Identificare și definire concept psihologic din text (6p)\n"
+            f"    b. Caracterizarea unui aspect al personalității: temperament / caracter / aptitudini (8p)\n"
+            f"    c. Comparație sau analiză (motivație, afectivitate, voință) (8p)\n"
+            f"    d. Exemplu personal argumentat (8p)\n\n"
+            f"SUBIECTUL al III-lea (30 puncte) — Eseu structurat:\n"
+            f"  Alege una dintre temele: comunicare și relații interpersonale / grupuri sociale și influențe /\n"
+            f"  sănătate mentală și stres / dezvoltare psihologică / conștiință de sine și identitate\n"
+            f"  Repere obligatorii:\n"
+            f"    1. Definiție și caracteristici (6p)\n"
+            f"    2. Factori / forme / tipuri cu exemple (12p)\n"
+            f"    3. Influențe și aplicații practice (8p)\n"
+            f"    4. Concluzie personală argumentată (4p)\n\n"
+            f"10 puncte din oficiu.\n\n"
+            f"IMPORTANT:\n"
+            f"- Textul de la S.II trebuie să fie autentic, relevant pentru adolescenți\n"
+            f"- Formulează cerințele exact ca la examen ('Precizați...', 'Caracterizați...', 'Analizați...')\n\n"
+            f"[[BAREM_BAC]]\n"
+            f"SUBIECTUL I — A: [răspunsuri corecte] B: [răspunsuri complete cu punctaj]\n"
+            f"SUBIECTUL al II-lea: [răspunsuri pentru fiecare cerință cu punctaj detaliat]\n"
+            f"SUBIECTUL al III-lea: [repere eseu cu punctaj: conținut 24p + redactare 6p]\n"
+            f"[[/BAREM_BAC]]"
         )
 
-    # ── LOGICĂ ──
+    # ── LOGICĂ ȘI ARGUMENTARE ──
     elif cod == "logica":
         return (
             f"Generează un subiect COMPLET de BAC la Logică și argumentare — {profil}, "
-            f"la nivel examen național România.\n\n"
-            f"STRUCTURĂ:\n"
-            f"SUBIECTUL I (30p) — propoziții logice, tabele de adevăr, inferențe valide/invalide, simbolizare\n"
-            f"SUBIECTUL al II-lea (30p) — analiză argumente: premize, concluzie, evaluare validitate, identificare sofisme\n"
-            f"SUBIECTUL al III-lea (30p) — construcție argument deductiv/inductiv pe o temă dată, contra-argumente\n"
-            f"10p din oficiu.\n\n"
-            f"[[BAREM_BAC]]\nSUBIECTUL I: [răspunsuri]\nSUBIECTUL al II-lea: [analiză]\nSUBIECTUL al III-lea: [repere argument]\n[[/BAREM_BAC]]"
+            f"IDENTIC ca structură și dificultate cu subiectele oficiale din România 2021–2025.\n\n"
+            f"STRUCTURĂ EXACTĂ (obligatorie):\n\n"
+            f"SUBIECTUL I (30 puncte) — Logică formală:\n"
+            f"  A. 4 itemi cu alegere multiplă × 4p — propoziții logice, valori de adevăr,\n"
+            f"     operatori (negație, conjuncție, disjuncție, implicație, echivalență)\n"
+            f"  B. 3 itemi semiobiectivi × 6p:\n"
+            f"     - Tabel de adevăr complet pentru o formulă (ex: ¬p∨q, p→q)\n"
+            f"     - Identificare tip inferență (modus ponens, modus tollens, silogism)\n"
+            f"     - Determinare validitate argument (cu contra-exemplu dacă invalid)\n\n"
+            f"SUBIECTUL al II-lea (30 puncte) — Analiza argumentelor:\n"
+            f"  - Text argumentativ scurt (100-150 cuvinte) pe o temă actuală\n"
+            f"  - 4 cerințe (a, b, c, d):\n"
+            f"    a. Identificare tip de raționament și structură (premize + concluzie) (6p)\n"
+            f"    b. Evaluarea validității argumentului (deductiv/inductiv/analogie) (8p)\n"
+            f"    c. Identificare sofisme sau erori de raționament (dacă există) cu denumire și explicație (8p)\n"
+            f"    d. Reformulare corectă a argumentului sau contra-argument (8p)\n\n"
+            f"SUBIECTUL al III-lea (30 puncte) — Construcție argument / eseu logic:\n"
+            f"  Temă dată (alege una): 'Rațiunea este superioară emoției' / 'Tehnologia ne face mai puțin liberi' /\n"
+            f"  'Legea morală și legea juridică coincid întotdeauna' / altă temă filozofică accesibilă.\n"
+            f"  Cerință: Construiește un argument DEDUCTIV VALID în favoarea sau împotriva tezei,\n"
+            f"  cu minimum 3 premize, identificând tipul de raționament folosit.\n"
+            f"  Repere obligatorii:\n"
+            f"    1. Formularea clară a tezei (pro/contra) (4p)\n"
+            f"    2. Minimum 3 premize coerente și relevante (12p)\n"
+            f"    3. Concluzia derivată logic din premize (6p)\n"
+            f"    4. Contra-argument și respingere (8p)\n\n"
+            f"10 puncte din oficiu.\n\n"
+            f"IMPORTANT:\n"
+            f"- Tabele de adevăr complete, nu parțiale\n"
+            f"- Sofismele trebuie denumite corect (ad hominem, om de paie, apel la autoritate etc.)\n"
+            f"- Argumentele trebuie să fie riguroase logic, nu doar convingătoare retoric\n\n"
+            f"[[BAREM_BAC]]\n"
+            f"SUBIECTUL I — A: [răspunsuri corecte] B: [tabele complete + justificări]\n"
+            f"SUBIECTUL al II-lea: [analiză detaliată a fiecărei cerințe cu punctaj]\n"
+            f"SUBIECTUL al III-lea: [structura argumentului model + punctaj detaliat]\n"
+            f"[[/BAREM_BAC]]"
         )
 
     # ── FALLBACK generic ──
@@ -6388,8 +6842,8 @@ def get_bac_correction_prompt(materie_label, subiect, raspuns_elev, from_photo=F
         f"[fiecare greșeală explicată]\n\n"
         f"## 🖊️ Calitatea limbii și exprimării\n"
         f"{lang_rules}"
-        f"## 🎓 Nota finală\n"
-        f"**Nota: X/10** — [verdict scurt]\n\n"
+        f"## 🎓 Nota estimată (orientativă)\n"
+        f"**Nota estimată: X/10** — [verdict scurt]. Precizează că e o estimare orientativă, nu nota oficială.\n\n"
         f"## 💡 Recomandări pentru BAC\n"
         f"[2-3 sfaturi concrete]\n\n"
         f"Fii constructiv, cald, dar riguros ca un examinator real."
@@ -7041,15 +7495,9 @@ def run_admitere_ui():
         if st.button("🚀 Generează subiect", type="primary", use_container_width=True):
             with st.spinner("📝 Se generează subiectul de admitere..."):
                 prompt = get_admitere_prompt(proba["cod"], proba, spec, univ, nivel_dificultate)
-                _stream_ph_full = st.empty()
-                _stream_ph_full.markdown("⏳ *Profesorul generează răspunsul...*")
-                full = ""
-                for _chunk in run_chat_with_rotation([], [prompt],
+                full = "".join(run_chat_with_rotation([], [prompt],
                     system_prompt=get_system_prompt(materie=None, pas_cu_pas=False,
-                        mod_avansat=True, mod_strategie=False, mod_bac_intensiv=False)):
-                    full += _chunk
-                    _stream_ph_full.markdown(full + "▌")
-                _stream_ph_full.empty()
+                        mod_avansat=True, mod_strategie=False, mod_bac_intensiv=False)))
                 barem_m = re.search(r'\[\[BAREM\]\](.*?)\[\[/BAREM\]\]', full, re.DOTALL)
                 barem = barem_m.group(1).strip() if barem_m else ""
                 subject_text = full[:barem_m.start()].strip() if barem_m else full
@@ -7115,7 +7563,7 @@ def run_admitere_ui():
         if not questions:
             # Dacă parsarea a eșuat, afișăm subiectul raw ca fallback
             with st.expander("📄 Subiectul", expanded=True):
-                render_message_with_svg(subject)
+                st.markdown(subject)
             st.divider()
             st.warning("Nu s-au putut parsa întrebările. Încearcă modul 'Răspuns liber'.")
         else:
@@ -7170,6 +7618,7 @@ def run_admitere_ui():
                     f"<b>{scor_total}/100p</b></h3>"
                     f"<div style='font-size:22px;font-weight:bold'>Nota: {nota}/10</div>"
                     f"</div>", unsafe_allow_html=True)
+                comercial.ui.nota_orientativa()
 
     # ── MOD RĂSPUNS LIBER ──
     else:
@@ -7194,15 +7643,9 @@ def run_admitere_ui():
                             f"RĂSPUNS CANDIDAT:\n{raspuns}\n\n"
                             f"Dă: punctaj per cerință, greșeli, nota/100, top 3 lacune de remediat."
                         )
-                        _stream_ph_corectare = st.empty()
-                        _stream_ph_corectare.markdown("⏳ *Profesorul generează răspunsul...*")
-                        corectare = ""
-                        for _chunk in run_chat_with_rotation([], [prompt_cor],
+                        corectare = "".join(run_chat_with_rotation([], [prompt_cor],
                             system_prompt=get_system_prompt(materie=None, pas_cu_pas=True,
-                                mod_avansat=True, mod_strategie=False, mod_bac_intensiv=False)):
-                            corectare += _chunk
-                            _stream_ph_corectare.markdown(corectare + "▌")
-                        _stream_ph_corectare.empty()
+                                mod_avansat=True, mod_strategie=False, mod_bac_intensiv=False)))
                         st.session_state.admitere_corectare = corectare
                         st.session_state.admitere_corectat = True
                         st.rerun()
@@ -7212,6 +7655,7 @@ def run_admitere_ui():
                         st.markdown(barem)
         else:
             st.success("✅ Corectare finalizată")
+            comercial.ui.nota_orientativa()
             st.markdown(st.session_state.admitere_corectare)
             if barem:
                 with st.expander("📋 Barem oficial"):
@@ -7276,7 +7720,7 @@ def run_bac_sim_ui():
     st.subheader("🎓 Simulare BAC")
 
     # ── ECRAN DE START ──
-    if not st.session_state.get("bac_active") and not st.session_state.get("_bac_force_display"):
+    if not st.session_state.get("bac_active"):
         # ── Selector ierarhic: Filieră → Profil → Specializare → Materie ──
         st.markdown("#### 🎓 Alege profilul tău")
         col1, col2 = st.columns(2)
@@ -7334,8 +7778,12 @@ def run_bac_sim_ui():
 
         bac_profil = bac_specializare  # profilul transmis la prompt = specializarea aleasă
 
-        # ── Selector tip fizică: real vs tehnologic ──
-        if info.get("cod") in ("fizica_real", "fizica_tehnologic"):
+        # ── Selector tip fizică: afișat DOAR dacă materia selectată este generic "Fizică"
+        # (adică vine din PROFILE_BAC cu un cod generic, nu dacă utilizatorul a ales
+        # deja explicit "🔬 Fizică real" sau "⚡ Fizică tehnolog" din dropdown)
+        # FIX Bug #3: condiția anterioară afișa radio-ul și când materia era deja specifică
+        _fizica_deja_specifica = bac_materie in ("🔬 Fizică real", "⚡ Fizică tehnolog")
+        if info.get("cod") in ("fizica_real", "fizica_tehnologic") and not _fizica_deja_specifica:
             tip_fizica = st.radio(
                 "🔬 Tip Fizică:",
                 options=["🔬 Fizică profil real (teoretic/militar)", "⚡ Fizică profil tehnologic"],
@@ -7344,11 +7792,11 @@ def run_bac_sim_ui():
             )
             # Suprascrie materia și info în funcție de alegere
             if "real" in tip_fizica:
-                bac_materie = "⚡ Fizică Real"
-                info = MATERII_BAC.get("⚡ Fizică Real", info)
+                bac_materie = "🔬 Fizică real"
+                info = MATERII_BAC.get("🔬 Fizică real", info)
             else:
-                bac_materie = "⚡ Fizică Tehnologic"
-                info = MATERII_BAC.get("⚡ Fizică Tehnologic", info)
+                bac_materie = "⚡ Fizică tehnolog"
+                info = MATERII_BAC.get("⚡ Fizică tehnolog", MATERII_BAC.get("⚡ Fizică tehnologică", info))
         # Dacă materia are profile proprii (ex. Chimie: anorganică/organică, Bio: vegetală/anatomie)
         elif len(info.get("profile", [])) > 1:
             bac_profil = st.selectbox(
@@ -7357,7 +7805,7 @@ def run_bac_sim_ui():
                 key="bac_prof_var_sel"
             )
 
-        use_timer = st.checkbox(f"⏱️ Cronometru ({info.get('timp_minute', 180)} min)", value=False, key="bac_timer")
+        use_timer = st.checkbox(f"⏱️ Cronometru ({info.get('timp_minute', 180)} min)", value=True, key="bac_timer")
 
         # Info card — diferit pt materii cu date reale vs fără
         if info.get("date_reale"):
@@ -7391,23 +7839,21 @@ def run_bac_sim_ui():
         with col_s:
             btn_lbl = "🚀 Generează subiect AI"
             if st.button(btn_lbl, type="primary", use_container_width=True):
-                prompt = get_bac_prompt_ai(bac_materie, info, bac_profil)
-                _sys = get_system_prompt(
-                    materie=None,
-                    pas_cu_pas=st.session_state.get("pas_cu_pas", False),
-                    mod_avansat=st.session_state.get("mod_avansat", False),
-                    mod_strategie=st.session_state.get("mod_strategie", False),
-                    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                # Streaming direct — menține conexiunea WebSocket activă pe toată durata
-                # "".join() blocat timp de 30-60s cauzează timeout și reset session_state
-                _placeholder = st.empty()
-                _placeholder.markdown("📝 *Se generează subiectul BAC...*")
-                full = ""
-                for _chunk in run_chat_with_rotation([], [prompt], system_prompt=_sys):
-                    full += _chunk
-                    _placeholder.markdown(full + "▌")
-                _placeholder.empty()
+                with st.spinner("📝 Se generează subiectul BAC..."):
+                    prompt = get_bac_prompt_ai(bac_materie, info, bac_profil)
+                    full = "".join(run_chat_with_rotation(
+                        [], [prompt],
+                        system_prompt=get_system_prompt(
+                            materie=None,
+                            pas_cu_pas=st.session_state.get("pas_cu_pas", False),
+                            mod_avansat=st.session_state.get("mod_avansat", False),
+                            mod_strategie=st.session_state.get("mod_strategie", False),
+                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                        )
+                    ))
                 subject_text, barem = parse_bac_subject(full)
+
+
                 st.session_state.update({
                     "bac_active": True,
                     "bac_materie": bac_materie,
@@ -7421,39 +7867,57 @@ def run_bac_sim_ui():
                     "bac_timp_min": info["timp_minute"],
                     "bac_use_timer": use_timer,
                 })
-                st.session_state["_bac_force_display"] = True
                 st.rerun()
         with col_b:
             if st.button("↩️ Înapoi la chat", use_container_width=True):
                 st.session_state.pop("bac_mode", None)
-                st.session_state.pop("_bac_force_display", None)
                 st.rerun()
         return
 
     # ── SIMULARE ACTIVĂ ──
-    # Guard: dacă bac_materie lipsește din session_state (după reconnect), resetăm
-    if not st.session_state.get("bac_materie") or not st.session_state.get("bac_subject"):
-        st.session_state.pop("bac_active", None)
-        st.session_state.pop("_bac_force_display", None)
-        st.rerun()
-        return
-
+    # ✅ FIX: Check if bac_materie and bac_profil are set before using them
+    if not st.session_state.get("bac_materie") or not st.session_state.get("bac_profil"):
+        st.error("❌ Eroare: Subiectul nu a fost generat corect. Reîncarcă pagina.")
+        st.stop()
+    
     col_title, col_timer = st.columns([3, 1])
     with col_title:
-        st.markdown(f"### {st.session_state.get('bac_materie', '')} · {st.session_state.get('bac_profil', '')}")
+        st.markdown(f"### {st.session_state.bac_materie} · {st.session_state.bac_profil}")
     with col_timer:
         if st.session_state.get("bac_use_timer") and st.session_state.get("bac_start_time"):
-            elapsed = int(time.time() - st.session_state.get("bac_start_time", 0))
-            total   = st.session_state.get("bac_timp_min", 180) * 60
+            elapsed = int(time.time() - st.session_state.bac_start_time)
+            total   = st.session_state.bac_timp_min * 60
             left    = max(0, total - elapsed)
             pct     = left / total
             color   = "#2ecc71" if pct > 0.5 else ("#e67e22" if pct > 0.2 else "#e74c3c")
-            st.markdown(
-                f'<div style="background:{color};color:white;padding:8px 12px;'
-                f'border-radius:8px;text-align:center;font-size:20px;font-weight:700">'
-                f'⏱️ {format_timer(left)}</div>',
-                unsafe_allow_html=True
-            )
+            if left > 0:
+                # Cronometrul numără în browser (JS doar în iframe-ul lui — fără reîncărcarea paginii).
+                # Înainte: window.parent.location.reload() la fiecare secundă — blocat în Chrome/Edge
+                # (iframe izolat), iar unde mergea ștergea textul nesalvat din răspuns.
+                components.html(
+                    f"""<div id="t" style="background:{color};color:white;padding:8px 12px;border-radius:8px;
+                    text-align:center;font:700 20px sans-serif">⏱️ {format_timer(left)}</div>
+                    <script>
+                    var end = Date.now() + {left} * 1000, total = {total};
+                    function pad(n) {{ return (n < 10 ? "0" : "") + n; }}
+                    function tick() {{
+                        var s = Math.max(0, Math.round((end - Date.now()) / 1000)), p = s / total;
+                        var el = document.getElementById("t");
+                        el.style.background = p > 0.5 ? "#2ecc71" : (p > 0.2 ? "#e67e22" : "#e74c3c");
+                        el.textContent = "⏱️ " + pad(Math.floor(s / 3600)) + ":" + pad(Math.floor(s % 3600 / 60)) + ":" + pad(s % 60);
+                        if (s > 0) setTimeout(tick, 1000);
+                    }}
+                    tick();
+                    </script>""",
+                    height=52,
+                )
+            else:
+                st.markdown(
+                    f'<div style="background:{color};color:white;padding:8px 12px;'
+                    f'border-radius:8px;text-align:center;font-size:20px;font-weight:700">'
+                    f'⏱️ {format_timer(left)}</div>',
+                    unsafe_allow_html=True
+                )
             if left == 0:
                 st.warning("⏰ Timpul a expirat!")
                 # FIX bug 15: la expirarea timpului, trimite automat răspunsul curent
@@ -7466,40 +7930,44 @@ def run_bac_sim_ui():
                     st.session_state["bac_timer_submitted"] = True
                     with st.spinner("⏰ Timp expirat — se corectează automat..."):
                         _prompt_timeout = get_bac_correction_prompt(
-                            st.session_state.get("bac_materie", ""),
-                            st.session_state.get("bac_subject", ""),
+                            st.session_state.bac_materie,
+                            st.session_state.bac_subject,
                             st.session_state.bac_raspuns,
                             from_photo=st.session_state.get("bac_from_photo", False),
                         )
-                        _stream_ph__corectare_timeout = st.empty()
-                        _stream_ph__corectare_timeout.markdown("⏳ *Profesorul generează răspunsul...*")
-                        _corectare_timeout = ""
-                        for _chunk in run_chat_with_rotation(
+                        _corectare_timeout = "".join(run_chat_with_rotation(
                             [], [_prompt_timeout],
                             system_prompt=get_system_prompt(
-                                materie=MATERII.get(st.session_state.get("bac_materie", "")),
+                                materie=MATERII.get(st.session_state.bac_materie),
                                 pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                                 mod_avansat=st.session_state.get("mod_avansat", False),
                                 mod_strategie=st.session_state.get("mod_strategie", False),
-                                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                        ):
-                            _corectare_timeout += _chunk
-                            _stream_ph__corectare_timeout.markdown(_corectare_timeout + "▌")
-                        _stream_ph__corectare_timeout.empty()
+                                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                            )
+                        ))
                     st.session_state.bac_corectare = _corectare_timeout
                     st.session_state.bac_corectat  = True
                     st.rerun()
             elif left > 0 and not st.session_state.get("bac_corectat"):
-                # ✅ FIX: Nu mai reîncărcăm pagina — subiectul rămâne vizibil
-                pass  # Continuăm fără reload, fără st.stop()
+                # La expirare rulăm din nou aplicația (fragmentul verifică la 10 s), ca ramura
+                # „Timpul a expirat” de mai sus să trimită automat lucrarea la corectat.
+                _bac_end = st.session_state.bac_start_time + total
+
+                @st.fragment(run_every=10)
+                def _bac_timer_watch():
+                    if time.time() >= _bac_end and not st.session_state.get("bac_corectat"):
+                        st.rerun()
+
+                _bac_timer_watch()
 
     st.divider()
 
-    with st.expander("📋 Subiectul", expanded=not st.session_state.get("bac_corectat", False)):
-        # ✅ FIX: render_message_with_svg în loc de st.markdown — afișează SVG corect
-        render_message_with_svg(st.session_state.get("bac_subject", ""))
+    with st.expander("📋 Subiectul", expanded=not st.session_state.bac_corectat):
+        # ✅ FIX: Use render_message_with_svg to properly display SVG drawings!
+        # Previously used st.markdown which doesn't render SVG, just shows raw code
+        render_message_with_svg(st.session_state.bac_subject)
 
-    if not st.session_state.get("bac_corectat", False):
+    if not st.session_state.bac_corectat:
         st.markdown("### ✏️ Răspunsurile tale")
 
         tab_foto, tab_text = st.tabs(["📷 Fotografiază lucrarea", "⌨️ Scrie manual"])
@@ -7522,12 +7990,16 @@ def run_bac_sim_ui():
             )
 
             if uploaded_photo:
-                st.image(uploaded_photo, caption="Fotografia încărcată", use_container_width=True)
+                # FIX Bug #4: citim bytes-urile ÎNAINTE de st.image() pentru a evita
+                # stream-ul consumat — st.image() poate avansa cursorul intern al fișierului,
+                # astfel încât uploaded_photo.read() ulterior ar returna b"" (bytes goale).
+                img_bytes = uploaded_photo.read()
+                st.image(img_bytes, caption="Fotografia încărcată", use_container_width=True)
 
                 if not st.session_state.get("bac_ocr_done"):
                     with st.spinner("🔍 Profesorul citește lucrarea..."):
-                        img_bytes = uploaded_photo.read()
-                        text_extras = extract_text_from_photo(img_bytes, st.session_state.get("bac_materie", ""))
+                        text_extras = extract_text_from_photo(img_bytes, st.session_state.bac_materie,
+                                                              mime_type=uploaded_photo.type or "image/jpeg")
                     st.session_state.bac_raspuns  = text_extras
                     st.session_state.bac_ocr_done = True
                     st.session_state.bac_from_photo = True
@@ -7535,26 +8007,21 @@ def run_bac_sim_ui():
                     # Pornește corectura automat
                     with st.spinner("📊 Se corectează lucrarea..."):
                         prompt = get_bac_correction_prompt(
-                            st.session_state.get("bac_materie", ""),
-                            st.session_state.get("bac_subject", ""),
+                            st.session_state.bac_materie,
+                            st.session_state.bac_subject,
                             text_extras,
                             from_photo=True
                         )
-                        _stream_ph_corectare = st.empty()
-                        _stream_ph_corectare.markdown("⏳ *Profesorul generează răspunsul...*")
-                        corectare = ""
-                        for _chunk in run_chat_with_rotation(
+                        corectare = "".join(run_chat_with_rotation(
                             [], [prompt],
                             system_prompt=get_system_prompt(
-                                materie=MATERII.get(st.session_state.get("bac_materie", "")),
+                                materie=MATERII.get(st.session_state.bac_materie),
                                 pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                                 mod_avansat=st.session_state.get("mod_avansat", False),
                                 mod_strategie=st.session_state.get("mod_strategie", False),
-                                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                        ):
-                            corectare += _chunk
-                            _stream_ph_corectare.markdown(corectare + "▌")
-                        _stream_ph_corectare.empty()
+                                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                            )
+                        ))
                     st.session_state.bac_corectare = corectare
                     st.session_state.bac_corectat  = True
                     st.rerun()
@@ -7565,9 +8032,11 @@ def run_bac_sim_ui():
 
         # ── TAB TEXT ──
         with tab_text:
+            # Valoarea doar prin session_state (vezi tema) — fără avertismentul value= + key=
+            if "bac_ans_input" not in st.session_state:
+                st.session_state["bac_ans_input"] = st.session_state.get("bac_raspuns", "")
             raspuns = st.text_area(
                 "Scrie rezolvarea completă:",
-                value=st.session_state.get("bac_raspuns", ""),
                 height=350,
                 placeholder="Subiectul I:\n1. ...\n2. ...\n\nSubiectul II:\n...\n\nSubiectul III:\n...",
                 key="bac_ans_input"
@@ -7579,26 +8048,21 @@ def run_bac_sim_ui():
                          disabled=not raspuns.strip()):
                 with st.spinner("📊 Se corectează lucrarea..."):
                     prompt = get_bac_correction_prompt(
-                        st.session_state.get("bac_materie", ""),
-                        st.session_state.get("bac_subject", ""),
+                        st.session_state.bac_materie,
+                        st.session_state.bac_subject,
                         raspuns,
                         from_photo=False
                     )
-                    _stream_ph_corectare = st.empty()
-                    _stream_ph_corectare.markdown("⏳ *Profesorul generează răspunsul...*")
-                    corectare = ""
-                    for _chunk in run_chat_with_rotation(
+                    corectare = "".join(run_chat_with_rotation(
                         [], [prompt],
                         system_prompt=get_system_prompt(
-                            materie=MATERII.get(st.session_state.get("bac_materie", "")),
+                            materie=MATERII.get(st.session_state.bac_materie),
                             pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                             mod_avansat=st.session_state.get("mod_avansat", False),
                             mod_strategie=st.session_state.get("mod_strategie", False),
-                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                    ):
-                        corectare += _chunk
-                        _stream_ph_corectare.markdown(corectare + "▌")
-                    _stream_ph_corectare.empty()
+                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                        )
+                    ))
                 st.session_state.bac_corectare = corectare
                 st.session_state.bac_corectat  = True
                 st.rerun()
@@ -7626,14 +8090,15 @@ def run_bac_sim_ui():
 
         if st.session_state.get("bac_show_barem") and st.session_state.get("bac_barem"):
             with st.expander("📋 Barem de corectare", expanded=True):
-                st.markdown(st.session_state.get("bac_barem", ""))
+                st.markdown(st.session_state.bac_barem)
 
     else:
         st.markdown("### 📊 Corectare AI")
-        st.markdown(st.session_state.get("bac_corectare", ""))
+        comercial.ui.nota_orientativa()
+        st.markdown(st.session_state.bac_corectare)
         if st.session_state.get("bac_barem"):
             with st.expander("📋 Barem"):
-                st.markdown(st.session_state.get("bac_barem", ""))
+                st.markdown(st.session_state.bac_barem)
         st.divider()
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -7655,7 +8120,7 @@ def run_bac_sim_ui():
                 st.session_state.bac_corectare = ""
                 st.session_state.bac_raspuns   = ""
                 if st.session_state.get("bac_use_timer"):
-                    st.session_state["bac_start_time"] = time.time()
+                    st.session_state.bac_start_time = time.time()
                 st.rerun()
         with col3:
             if st.button("💬 Înapoi la chat", use_container_width=True):
@@ -7706,7 +8171,7 @@ def get_homework_correction_prompt(materie_label: str, text_tema: str, from_phot
         f"[fiecare greșeală de materie explicată, cu varianta corectă]\n\n"
         f"{corectare_limba}"
         f"## 📊 Notă orientativă\n"
-        f"**Nota: X/10** — [justificare scurtă]\n\n"
+        f"**Nota estimată: X/10** — [justificare scurtă]. Precizează că e o estimare orientativă.\n\n"
         f"## 💡 Sfaturi pentru data viitoare\n"
         f"[2-3 recomandări concrete și aplicabile]\n\n"
         f"Ton: cald, constructiv, ca un profesor care vrea să ajute, nu să descurajeze."
@@ -7748,28 +8213,24 @@ def run_homework_ui():
             if hw_photo and not st.session_state.get("hw_ocr_done"):
                 st.image(hw_photo, caption="Fotografia încărcată", use_container_width=True)
                 with st.spinner("🔍 Profesorul citește tema..."):
-                    text_extras = extract_text_from_photo(hw_photo.read(), hw_materie)
+                    text_extras = extract_text_from_photo(hw_photo.getvalue(), hw_materie,
+                                                          mime_type=hw_photo.type or "image/jpeg")
                 st.session_state.hw_text       = text_extras
                 st.session_state.hw_ocr_done   = True
                 st.session_state.hw_from_photo = True
                 st.session_state.hw_materie    = hw_materie
                 with st.spinner("📝 Se corectează tema..."):
                     prompt = get_homework_correction_prompt(hw_materie, text_extras, from_photo=True)
-                    _stream_ph_corectare = st.empty()
-                    _stream_ph_corectare.markdown("⏳ *Profesorul generează răspunsul...*")
-                    corectare = ""
-                    for _chunk in run_chat_with_rotation(
+                    corectare = "".join(run_chat_with_rotation(
                         [], [prompt],
                         system_prompt=get_system_prompt(
                             materie=MATERII.get(hw_materie),
                             pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                             mod_avansat=st.session_state.get("mod_avansat", False),
                             mod_strategie=st.session_state.get("mod_strategie", False),
-                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                    ):
-                        corectare += _chunk
-                        _stream_ph_corectare.markdown(corectare + "▌")
-                    _stream_ph_corectare.empty()
+                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                        )
+                    ))
                 st.session_state.hw_corectare = corectare
                 st.session_state.hw_done      = True
                 st.rerun()
@@ -7778,9 +8239,12 @@ def run_homework_ui():
                     st.text(st.session_state.get("hw_text", ""))
 
         with tab_text:
+            # Valoarea se pune prin session_state (nu și prin value=), altfel Streamlit afișează
+            # avertismentul „created with a default value but also had its value set via Session State”.
+            if "hw_text_input" not in st.session_state:
+                st.session_state["hw_text_input"] = st.session_state.get("hw_text", "")
             hw_text = st.text_area(
                 "Lipește sau scrie textul temei:",
-                value=st.session_state.get("hw_text", ""),
                 height=300,
                 placeholder="Scrie sau lipește tema aici...",
                 key="hw_text_input"
@@ -7792,21 +8256,16 @@ def run_homework_ui():
                 st.session_state.hw_from_photo = False
                 with st.spinner("📝 Se corectează tema..."):
                     prompt = get_homework_correction_prompt(hw_materie, hw_text, from_photo=False)
-                    _stream_ph_corectare = st.empty()
-                    _stream_ph_corectare.markdown("⏳ *Profesorul generează răspunsul...*")
-                    corectare = ""
-                    for _chunk in run_chat_with_rotation(
+                    corectare = "".join(run_chat_with_rotation(
                         [], [prompt],
                         system_prompt=get_system_prompt(
                             materie=MATERII.get(hw_materie),
                             pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                             mod_avansat=st.session_state.get("mod_avansat", False),
                             mod_strategie=st.session_state.get("mod_strategie", False),
-                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
-                    ):
-                        corectare += _chunk
-                        _stream_ph_corectare.markdown(corectare + "▌")
-                    _stream_ph_corectare.empty()
+                            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                        )
+                    ))
                 st.session_state.hw_corectare = corectare
                 st.session_state.hw_done      = True
                 st.rerun()
@@ -7818,6 +8277,7 @@ def run_homework_ui():
         if st.session_state.get("hw_from_photo") and st.session_state.get("hw_text"):
             with st.expander("📄 Text extras din poză", expanded=False):
                 st.text(st.session_state.hw_text)
+        comercial.ui.nota_orientativa()
         st.markdown(st.session_state.hw_corectare)
         st.divider()
         col1, col2 = st.columns(2)
@@ -7988,7 +8448,8 @@ def run_quiz_ui():
                         pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                         mod_avansat=st.session_state.get("mod_avansat", False),
                         mod_strategie=st.session_state.get("mod_strategie", False),
-                        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                    )
                 ):
                     full_resp += chunk
 
@@ -8074,171 +8535,68 @@ def run_quiz_ui():
 
 
 # ============================================================
-# === CONTEXT CACHING — Gemini API (cu persistenta Supabase) ===
+# === CONTEXT CACHING — Gemini API ===
 # ============================================================
-# System prompt-ul are ~21.000 tokeni. Fara caching, fiecare mesaj
-# trimite toti acesti tokeni = cost ridicat. Cu caching, platim o
-# singura data per sesiune si apoi mult mai putin pentru tokenii cached.
+# System prompt-ul are ~21.000 tokeni. Fără caching, fiecare mesaj
+# trimite toți acești tokeni = cost ridicat. Cu caching, platim o
+# singură dată per sesiune și apoi mult mai puțin pentru tokenii cached.
 #
-# Cerinte Gemini API Context Caching (sursa: ai.google.dev/gemini-api/docs/pricing, mar 2026):
-#   - Minim 1.024 tokeni in cache (system prompt-ul nostru e ~21k, OK)
-#   - TTL minim 1 minut, maxim 1 ora (folosim 10 minute)
-#   - Functioneaza cu: gemini-2.5-flash, gemini-2.5-pro
+# Cerințe Gemini API Context Caching (sursa: ai.google.dev/gemini-api/docs/pricing):
+#   - Minim 1.024 tokeni în cache (system prompt-ul nostru e ~21k, OK)
+#   - TTL minim 1 minut, maxim 1 oră (folosim 10 minute)
+#   - Dacă gemini-3.1-flash-lite nu suportă caching pe cheia curentă, apelul eșuează
+#     silențios și codul face fallback automat la apel normal fără caching (vezi except
+#     din _get_or_create_cache) — deci caching-ul e un bonus, nu o cerință obligatorie.
+#   → Folosim GEMINI_MODEL (gemini-3.1-flash-lite) ca model principal (caching + fallback)
 #
-# IMBUNATATIRE fata de versiunea anterioara:
-#   - Cache-ul era stocat DOAR in session_state → se pierdea la fiecare
-#     reconnect WebSocket, restart telefon sau refresh pagina.
-#   - Acum stocat SI in Supabase (tabelul prompt_cache) → persistent
-#     cross-restart, cross-session, reutilizat de toti utilizatorii cu
-#     aceeasi cheie API si acelasi system prompt.
-#   - Doua niveluri: session_state (L1, instant) + Supabase (L2, persistent).
-#   - TTL marit la 55 minute (aproape de maximul de 1 ora al Gemini API).
+# Cache key: hash(system_prompt + api_key) → unic per prompt + cheie
 
-_CACHE_TTL_SECONDS = 3300         # 55 minute TTL (aproape de maximul de 1 ora)
-_CACHE_REFRESH_AT  = 3000         # Reimprospatam la 50 minute (5 min inainte de expirare)
+# Stocare cache: {cache_key: {"name": "cachedContents/...", "expires_at": float}}
+# FIX: stocat în st.session_state în loc de variabilă globală de modul —
+# Streamlit re-execută întregul script la fiecare rerun, deci o variabilă globală
+# se resetează la {} la fiecare interacțiune, anulând complet beneficiile caching-ului.
+_CACHE_TTL_SECONDS = 600          # 10 minute TTL (bine sub limita de 1 oră)
+_CACHE_REFRESH_AT  = 480          # Reîmprospătăm la 8 minute (2 min înainte de expirare)
 _CACHE_MIN_TOKENS  = 1024         # Minim tokeni pentru caching (limita Gemini)
+# Prețuri: https://ai.google.dev/gemini-api/docs/pricing (sept. 2026)
+# gemini-3.1-flash-lite: $0.25/$1.50 per 1M tokens normal, cached input disponibil
 _CACHE_MODEL       = GEMINI_MODEL  # Model principal cu caching
 
 
 def _get_prompt_hash(prompt_text: str, api_key: str) -> str:
-    """Genereaza un hash scurt unic pentru (prompt, cheie) — folosit ca cache key."""
-    return hashlib.sha256(f"{api_key[:8]}:{prompt_text}".encode()).hexdigest()[:16]
-
-
-def _cache_read_l1(cache_key: str) -> str | None:
-    """Nivel 1: citeste din session_state (instant, fara Supabase)."""
-    now = time.time()
-    store = st.session_state.get("_prompt_cache_store", {})
-    entry = store.get(cache_key)
-    if entry and entry.get("expires_at", 0) > now:
-        # Verifica ca mai are cel putin _CACHE_REFRESH_AT secunde valabile
-        if (entry["expires_at"] - now) > (_CACHE_TTL_SECONDS - _CACHE_REFRESH_AT):
-            return entry["name"]
-    return None
-
-
-def _cache_write_l1(cache_key: str, cache_name: str,
-                    expires_at: float, api_key_prefix: str) -> None:
-    """Nivel 1: scrie in session_state."""
-    store = st.session_state.setdefault("_prompt_cache_store", {})
-    # Curata intrarile expirate simultan
-    now = time.time()
-    st.session_state["_prompt_cache_store"] = {
-        k: v for k, v in store.items() if v.get("expires_at", 0) > now
-    }
-    st.session_state["_prompt_cache_store"][cache_key] = {
-        "name":           cache_name,
-        "expires_at":     expires_at,
-        "api_key_prefix": api_key_prefix,
-    }
-
-
-def _cache_read_l2(cache_key: str) -> tuple[str, float] | None:
-    """
-    Nivel 2: citeste din Supabase (persistent cross-restart).
-    Returneaza (cache_name, expires_at) sau None.
-    """
-    if not is_supabase_available():
-        return None
-    try:
-        client = get_supabase_client()
-        if not client:
-            return None
-        now = time.time()
-        resp = client.table("prompt_cache").select(
-            "cache_name, expires_at"
-        ).eq("cache_key", cache_key).gt("expires_at", now).execute()
-        if resp.data:
-            row = resp.data[0]
-            return row["cache_name"], float(row["expires_at"])
-        return None
-    except Exception as e:
-        _log(f"Cache L2 read error (non-critic): {e}", "silent")
-        return None
-
-
-def _cache_write_l2(cache_key: str, cache_name: str,
-                    expires_at: float, api_key_prefix: str) -> None:
-    """Nivel 2: scrie in Supabase. Silent la eroare."""
-    if not is_supabase_available():
-        return
-    try:
-        client = get_supabase_client()
-        if not client:
-            return
-        client.table("prompt_cache").upsert({
-            "cache_key":      cache_key,
-            "cache_name":     cache_name,
-            "expires_at":     expires_at,
-            "api_key_prefix": api_key_prefix,
-            "created_at":     time.time(),
-        }).execute()
-    except Exception as e:
-        _log(f"Cache L2 write error (non-critic): {e}", "silent")
-
-
-def _cache_invalidate_by_key_prefix(api_key_prefix: str) -> None:
-    """
-    Invalideaza toate cache-urile pentru o cheie API rotita/expirata.
-    Sterge din L1 (session_state) si din L2 (Supabase).
-    """
-    # L1
-    store = st.session_state.get("_prompt_cache_store", {})
-    st.session_state["_prompt_cache_store"] = {
-        k: v for k, v in store.items()
-        if v.get("api_key_prefix") != api_key_prefix
-    }
-    # L2
-    if not is_supabase_available():
-        return
-    try:
-        client = get_supabase_client()
-        if not client:
-            return
-        client.table("prompt_cache").delete().eq(
-            "api_key_prefix", api_key_prefix
-        ).execute()
-    except Exception as e:
-        _log(f"Cache L2 invalidate error (non-critic): {e}", "silent")
+    """Generează un hash scurt unic pentru (prompt, cheie) — folosit ca cache key local."""
+    return hashlib.sha256(f"{api_key}:{prompt_text}".encode()).hexdigest()[:16]
 
 
 def _get_or_create_cache(client: "genai.Client", prompt_text: str, api_key: str) -> str | None:
-    """
-    Returneaza numele unui CachedContent valid, sau None daca caching esueaza.
+    """Returnează numele unui CachedContent valid, sau None dacă caching eșuează.
 
-    Flux cu doua niveluri:
-      L1 (session_state, instant):
-        - Daca exista si e valabil → returneaza imediat, fara Supabase
-      L2 (Supabase, persistent cross-restart):
-        - Daca exista in DB → il incarcam in L1 si returnam
-        - Daca nu exista → cream via Gemini API, scriem in L1 + L2
-
-    Astfel, dupa un restart/reconnect WebSocket, cache-ul e recuperat din DB
-    in loc sa fie recreat (evitam ~0.5s latenta si consumul suplimentar de quota).
+    Logică:
+      1. Verifică dacă avem un cache valid în st.session_state["_prompt_cache_store"]
+      2. Dacă nu (sau expirat), creează unul nou via API
+      3. La orice eroare → returnează None (apelantul face fallback fără caching)
+    Curățare: la fiecare apel elimină intrările expirate din dicționar (anti memory leak).
     """
+    # FIX: folosim session_state în loc de variabilă globală — supraviețuiește reruns Streamlit
+    cache_store = st.session_state.setdefault("_prompt_cache_store", {})
+
     cache_key = _get_prompt_hash(prompt_text, api_key)
-    api_key_prefix = api_key[:8]
     now = time.time()
 
-    # ── L1: session_state ──
-    name_l1 = _cache_read_l1(cache_key)
-    if name_l1:
-        return name_l1
+    # Curăță intrările expirate — O(n) dar n e mic (1 intrare per cheie API × prompt)
+    st.session_state["_prompt_cache_store"] = {
+        k: v for k, v in cache_store.items()
+        if v.get("expires_at", 0) > now
+    }
+    cache_store = st.session_state["_prompt_cache_store"]
 
-    # ── L2: Supabase ──
-    result_l2 = _cache_read_l2(cache_key)
-    if result_l2:
-        cache_name, expires_at = result_l2
-        # Verifica ca mai are timp suficient (nu e pe cale sa expire)
-        if (expires_at - now) > (_CACHE_TTL_SECONDS - _CACHE_REFRESH_AT):
-            # Populeaza L1 din L2 (warm-up dupa restart)
-            _cache_write_l1(cache_key, cache_name, expires_at, api_key_prefix)
-            return cache_name
-        # Cache gasit in DB dar aproape expirat → il recreem mai jos
+    # 1. Verifică cache-ul existent
+    existing = cache_store.get(cache_key)
+    if existing and (existing["expires_at"] - now) > (_CACHE_TTL_SECONDS - _CACHE_REFRESH_AT):
+        return existing["name"]
 
-    # ── Creare cache nou via Gemini API ──
+    # 2. Creează cache nou
     try:
-        expires_at = now + _CACHE_TTL_SECONDS
         cached = client.caches.create(
             model=_CACHE_MODEL,
             config=genai_types.CreateCachedContentConfig(
@@ -8246,99 +8604,281 @@ def _get_or_create_cache(client: "genai.Client", prompt_text: str, api_key: str)
                 ttl=f"{_CACHE_TTL_SECONDS}s",
             ),
         )
-        _cache_write_l1(cache_key, cached.name, expires_at, api_key_prefix)
-        _cache_write_l2(cache_key, cached.name, expires_at, api_key_prefix)
+        st.session_state["_prompt_cache_store"][cache_key] = {
+            "name": cached.name,
+            "expires_at": now + _CACHE_TTL_SECONDS,
+            "api_key_prefix": api_key[:8],
+        }
         return cached.name
     except Exception as e:
-        # Caching poate esua daca: prompt prea scurt, model incompatibil,
-        # cheie fara permisiuni etc. → fallback silentios la apel normal
-        _log(f"Context caching indisponibil (fallback fara caching): {e}", "silent")
+        # Caching poate eșua dacă: prompt prea scurt, model incompatibil,
+        # cheie fără permisiuni etc. → fallback silențios la apel normal
+        _log(f"Context caching indisponibil (fallback fără caching): {e}", "silent")
         return None
 
 
 def _invalidate_cache_for_key(api_key: str) -> None:
+    """Invalidează toate intrările din cache pentru o cheie API dată.
+    Apelat când cheia e rotită (invalidă/epuizată) sau promptul se schimbă.
     """
-    Invalideaza toate intrarile din cache pentru o cheie API data.
-    Apelat cand cheia e rotita (invalida/epuizata).
-    Wrapper peste _cache_invalidate_by_key_prefix pentru compatibilitate cu codul existent.
+    # FIX: folosim session_state în loc de variabilă globală
+    cache_store = st.session_state.get("_prompt_cache_store", {})
+    prefix = api_key[:8]
+    st.session_state["_prompt_cache_store"] = {
+        k: v for k, v in cache_store.items()
+        if v.get("api_key_prefix") != prefix
+    }
+
+
+def _reupload_gfile(client, old_gfile):
+    """Re-urcă un fișier atașat pe proiectul cheii curente.
+
+    Fișierele din Google Files API aparțin PROIECTULUI cheii care le-a încărcat: după o rotație
+    spre o cheie din alt proiect, URI-ul vechi dă 403. Octeții originali sunt păstrați în
+    st.session_state["_gsrc_map"] (doar fișiere ≤ 25 MB). Returnează fișierul nou sau None.
     """
-    _cache_invalidate_by_key_prefix(api_key[:8])
+    srcs = st.session_state.get("_gsrc_map") or {}
+    src = srcs.get(getattr(old_gfile, "name", ""))
+    if not src:
+        return None
+    data, mime = src
+    suffix = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+              "image/gif": ".gif", "application/pdf": ".pdf"}.get(mime, ".bin")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        new = client.files.upload(file=tmp_path, config=genai_types.UploadFileConfig(mime_type=mime))
+        poll = 0
+        while str(new.state) in ("FileState.PROCESSING", "PROCESSING") and poll < 60:
+            time.sleep(1)
+            new = client.files.get(name=new.name)
+            poll += 1
+        if not _is_gfile_active(new):
+            return None
+        srcs[new.name] = (data, mime)                # păstrăm și intrarea veche (retry cu payload vechi)
+        for key in [x for x in st.session_state.keys() if str(x).startswith("_gfile_")]:
+            if getattr(st.session_state.get(key), "name", None) == old_gfile.name:
+                st.session_state[key] = new            # reruns viitoare folosesc fișierul nou
+        return new
+    except Exception:
+        return None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
+def _ensure_gfile_for_client(client, gfile):
+    """Fișierul e vizibil cu cheia curentă? Da -> îl păstrăm (aceleași proiecte). Nu -> îl re-urcăm."""
+    try:
+        cur = client.files.get(name=gfile.name)
+        if _is_gfile_active(cur):
+            return gfile
+    except Exception:
+        pass
+    return _reupload_gfile(client, gfile) or gfile
 
-def run_chat_with_rotation(history_obj, payload, system_prompt=None):
-    """Rulează chat cu rotație automată a cheilor API, fallback modele și context caching.
 
-    Context Caching: system prompt-ul (~21k tokeni) e cached pentru 10 minute.
-    Tokenii cached costă ~4× mai puțin decât tokenii normali (prețuri Gemini API).
-    Caching funcționează pe gemini-2.5-flash; fallback automat dacă API-ul refuză.
+# === LANȚ DE MODELE + MEMORIA COTELOR EPUIZATE ===
+# Cotele gratuite Gemini sunt per PROIECT Google și per MODEL (AI Studio → Rate limit, nov. 2026):
+#   gemini-3.1-flash-lite / gemini-3.5-flash-lite : 15 RPM · 250K TPM · 500 RPD  (cele mai generoase)
+#   gemini-3.6-flash / gemini-3-flash-preview / gemini-3.8-flash / gemini-2.5-flash : 5 RPM · 20 RPD
+#   gemini-2.5-flash-lite : 10 RPM · 20 RPD
+# Ordinea = cota zilnică mare întâi, apoi rezervele mici. Fiecare combinație (cheie, model)
+# care primește 429 e ținută minte (comun pentru TOȚI elevii, cât trăiește serverul):
+#   - limită pe zi  → sărită până la resetare (miezul nopții Pacific ≈ 10:00 ora României)
+#   - limită pe minut / supraîncărcare → sărită ~1 minut
+#   - model inexistent (404) → sărit 6 ore; cheie invalidă → sărită 1 oră pe toate modelele
+# Astfel un mesaj nu mai pierde timp încercând combinații epuizate: alege direct prima liberă.
+MODEL_CHAIN = [
+    GEMINI_MODEL,               # gemini-3.1-flash-lite — principal (+ context caching)
+    "gemini-3.5-flash-lite",    # 500 RPD
+    "gemini-3.6-flash",         # 20 RPD
+    "gemini-3-flash-preview",   # 20 RPD
+    "gemini-3.8-flash",         # 20 RPD
+    "gemini-2.5-flash",         # 20 RPD (gândire prin thinking_budget)
+    "gemini-2.5-flash-lite",    # 20 RPD
+]
+MODEL_FALLBACKS_NO_CACHE = MODEL_CHAIN   # nume vechi, păstrat pentru compatibilitate
+
+
+@st.cache_resource
+def _get_quota_state() -> dict:
+    return {"lock": threading.Lock(), "blocked": {}}   # (amprentă_cheie | "*", model | "*") -> până_la
+
+
+def _key_fp(api_key: str) -> str:
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:12]
+
+
+def _next_quota_reset() -> float:
+    """Timestamp-ul următoarei resetări a cotelor zilnice (miezul nopții America/Los_Angeles)."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Los_Angeles")
+        now = datetime.now(tz)
+        nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=5, microsecond=0)
+        return nxt.timestamp()
+    except Exception:
+        now = datetime.now(timezone.utc)
+        return (now + timedelta(hours=24)).timestamp()
+
+
+def _quota_block(api_key: str | None, model: str | None, until: float):
+    st_ = _get_quota_state()
+    k = (_key_fp(api_key) if api_key else "*", model or "*")
+    with st_["lock"]:
+        st_["blocked"][k] = max(until, st_["blocked"].get(k, 0))
+
+
+def _quota_blocked_until(api_key: str, model: str) -> float:
+    st_ = _get_quota_state()
+    now = time.time()
+    fp = _key_fp(api_key)
+    with st_["lock"]:
+        b = st_["blocked"]
+        for k in [k for k, v in b.items() if v <= now]:   # curățăm intrările expirate
+            del b[k]
+        return max(b.get((fp, model), 0), b.get((fp, "*"), 0), b.get(("*", model), 0))
+
+
+def _quota_until_from_error(msg: str) -> float:
+    """Cât timp ocolim combinația după un 429: până la resetarea zilnică sau câteva secunde/minute."""
+    low = msg.lower()
+    if "perday" in low or "per_day" in low or "per day" in low or "requests_per_day" in low or "rpd" in low:
+        return _next_quota_reset()
+    m = re.search(r"retry(?:_delay|delay)?[^0-9]{0,20}([0-9]+(?:\.[0-9]+)?)\s*s", low)
+    wait = float(m.group(1)) if m else 60.0
+    return time.time() + min(max(wait, 5.0), 300.0)
+
+
+def _pick_key_and_model(chain: list) -> tuple[int, int] | None:
+    """Prima combinație liberă: cheia curentă întâi (toate modelele), apoi celelalte chei."""
+    n = len(keys)
+    start = st.session_state.get("key_index", 0) % max(n, 1)
+    for off in range(n):
+        ki = (start + off) % n
+        for mi, m in enumerate(chain):
+            if _quota_blocked_until(keys[ki], m) <= time.time():
+                return ki, mi
+    return None
+
+
+def quota_status_text() -> str:
+    """Rezumat pentru panoul de diagnostic: câte combinații cheie×model sunt epuizate acum."""
+    total = len(keys) * len(MODEL_CHAIN)
+    free = sum(1 for k in keys for m in MODEL_CHAIN if _quota_blocked_until(k, m) <= time.time())
+    return f"{free}/{total} combinații cheie×model disponibile"
+
+
+def _thinking_config_for(model_name: str):
+    """Gemini 3.x: thinking_level; Gemini 2.5: thinking_budget (nu acceptă thinking_level)."""
+    high = st.session_state.get("mod_gandire_extinsa", False)
+    if model_name.startswith("gemini-2.5"):
+        return genai_types.ThinkingConfig(thinking_budget=-1 if high else 0)
+    return genai_types.ThinkingConfig(thinking_level="high" if high else "low")
+
+
+def _student_profile_context() -> str:
+    """Profilul elevului (din cont), adăugat la system prompt ca explicațiile să fie pe nivelul lui.
+    Puține combinații posibile (clasă × specializare) → context caching-ul rămâne eficient."""
+    u = current_user() or {}
+    clasa, fil, prof, spec = u.get("clasa"), u.get("filiera"), u.get("profil_liceu"), u.get("specializare")
+    if not any([clasa, fil, prof, spec]):
+        return ""
+    lines = ["", "", "PROFILUL ELEVULUI (folosește-l ca să adaptezi explicațiile; nu-l mai întreba):"]
+    if clasa:
+        lines.append(f"- Clasa: a {clasa}-a")
+    if fil:
+        lines.append(f"- Filiera: {fil}")
+    if prof:
+        lines.append(f"- Profilul: {prof}")
+    if spec:
+        lines.append(f"- Specializarea: {spec}")
+        _d = globals().get("PROFILE_BAC", {}).get(fil or "", {}).get(prof or "", {}).get(spec, {})
+        if isinstance(_d, dict):
+            if _d.get("materii_obligatorii"):
+                lines.append("- Materii obligatorii la BAC: " + ", ".join(_d["materii_obligatorii"]))
+            if _d.get("materii_optionale"):
+                lines.append("- Materii la alegere la BAC: " + ", ".join(_d["materii_optionale"]))
+    return "\n".join(lines)
+
+
+def run_chat_with_rotation(history_obj, payload, system_prompt=None, live_stream=False, use_cache=True):
+    """Rulează chat cu rotație automată a cheilor API, lanț de modele de rezervă și context caching.
+
+    La fiecare încercare alege prima combinație (cheie, model) care nu e marcată ca epuizată
+    (vezi _get_quota_state). Un 429 marchează combinația și trece imediat la următoarea:
+    alt model pe aceeași cheie, apoi cheia următoare — fără să mai reîncerce ce e deja epuizat.
+
+    live_stream=False: răspunsul e colectat integral și emis la final (reîncercare transparentă).
+    live_stream=True: bucățile sunt emise imediat; după prima bucată nu se mai reîncearcă
+        (ar dubla textul) — vezi _salvage_partial_response().
+    use_cache=False: fără context caching (ex. OCR, unde promptul e scurt).
     """
-    # Model: gemini-2.5-flash (principal + caching + fallback fără caching)
-    MODEL_WITH_CACHE    = _CACHE_MODEL
-    # Prețuri (mar 2026, ai.google.dev/gemini-api/docs/pricing):
-    # gemini-2.5-flash: model principal, suportă caching
-    # Prețuri (mar 2026): $0.30/$2.50 per 1M normal, cached input disponibil
-    MODEL_FALLBACKS_NO_CACHE = [
-        GEMINI_MODEL,   # fallback fără caching: același model, apel normal
-    ]
+    MODEL_WITH_CACHE = _CACHE_MODEL
+    chain = MODEL_CHAIN
 
-    # Guard: dacă nu există chei API configurate, aruncă eroare clară (nu IndexError silențios)
     if not keys:
         raise Exception(
             "Nicio cheie API Gemini configurată. "
-            "Adaugă cel puțin o cheie în st.secrets['GEMINI_KEYS'] sau introdu-o manual în sidebar."
+            "Adaugă cel puțin o cheie în st.secrets['GOOGLE_API_KEYS'] sau introdu-o manual în sidebar."
         )
 
-    active_prompt = system_prompt or st.session_state.get("system_prompt") or SYSTEM_PROMPT
-    max_retries = max(len(keys) * 3, 6)
-    last_error = None
-    _deadline = time.time() + 45  # Timeout global: max 45 secunde de reîncercări
+    # Versiunea comercială: cont, acord parental, abonament și limita zilnică (ridică AccessError)
+    comercial.billing.consume(current_user())
 
-    # Încearcă să obțină un cache valid pentru system prompt
-    # _use_cache = True înseamnă că prima încercare va folosi modelul cu caching
-    _use_cache = st.session_state.get("_ctx_cache_enabled", True)
+    active_prompt = (system_prompt or st.session_state.get("system_prompt") or SYSTEM_PROMPT) \
+        + _student_profile_context()
+    max_retries = len(keys) * len(chain) + 6
+    _payload_list = list(payload) if isinstance(payload, list) else [payload]
+    _has_gfile = any((not isinstance(p, str)) and hasattr(p, "uri") for p in _payload_list)
+    _file_refresh_pending = False
+    _file_refreshes = 0
+    _deadline = time.time() + 60
+    _use_cache = use_cache and st.session_state.get("_ctx_cache_enabled", True)
+    _last_kind = None   # "quota" | "overload" | "invalid" | "missing"
 
     for attempt in range(max_retries):
-        if st.session_state.key_index >= len(keys):
-            st.session_state.key_index = 0
-        current_key = keys[st.session_state.key_index]
-
-        # Selectăm modelul: cu caching (prima încercare) sau fallback fără caching
-        if _use_cache and attempt == 0:
-            model_name = MODEL_WITH_CACHE
-        else:
-            fb_idx = min(
-                (attempt - 1) // max(len(keys), 1) if not _use_cache else attempt // max(len(keys), 1),
-                len(MODEL_FALLBACKS_NO_CACHE) - 1
+        pick = _pick_key_and_model(chain)
+        if pick is None:
+            if _last_kind == "overload":
+                raise Exception("Serviciul AI este supraîncărcat. Te rugăm să încerci din nou în câteva secunde. 🐢")
+            raise Exception(
+                "Toate cheile API sunt epuizate sau invalide pentru azi. "
+                "Cotele se resetează în jurul orei 10:00 (ora României). 🔑"
             )
-            model_name = MODEL_FALLBACKS_NO_CACHE[max(fb_idx, 0)]
+        ki, mi = pick
+        if ki != st.session_state.get("key_index", 0):
+            st.session_state.key_index = ki
+            if _has_gfile:
+                _file_refresh_pending = True   # cheia nouă poate fi în alt proiect Google
+            if attempt > 0:
+                st.toast(f"🔄 Trec pe cheia {ki + 1}/{len(keys)}...", icon="🔑")
+        current_key = keys[ki]
+        model_name = chain[mi]
 
+        cached_content_name = None
+        _started = False
         try:
-            gemini_client = get_gemini_client(current_key)
+            gemini_client = genai.Client(api_key=current_key)
 
-            # --- Context Caching ---
-            cached_content_name = None
             if _use_cache and model_name == MODEL_WITH_CACHE:
                 cached_content_name = _get_or_create_cache(gemini_client, active_prompt, current_key)
 
+            _cfg = dict(
+                safety_settings=[
+                    genai_types.SafetySetting(category=s["category"], threshold=s["threshold"])
+                    for s in safety_settings
+                ],
+                thinking_config=_thinking_config_for(model_name),
+            )
             if cached_content_name:
-                # Apel cu caching: system prompt e deja în cache → nu îl mai trimitem
-                gen_config = genai_types.GenerateContentConfig(
-                    cached_content=cached_content_name,
-                    safety_settings=[
-                        genai_types.SafetySetting(category=s["category"], threshold=s["threshold"])
-                        for s in safety_settings
-                    ],
-                )
+                gen_config = genai_types.GenerateContentConfig(cached_content=cached_content_name, **_cfg)
             else:
-                # Apel normal (fără caching): trimitem system prompt complet
-                gen_config = genai_types.GenerateContentConfig(
-                    system_instruction=active_prompt,
-                    safety_settings=[
-                        genai_types.SafetySetting(category=s["category"], threshold=s["threshold"])
-                        for s in safety_settings
-                    ],
-                )
+                gen_config = genai_types.GenerateContentConfig(system_instruction=active_prompt, **_cfg)
 
             history_new = []
             for msg in history_obj:
@@ -8349,8 +8889,16 @@ def run_chat_with_rotation(history_obj, payload, system_prompt=None):
                     )
                 )
 
+            if _file_refresh_pending:
+                _payload_list = [
+                    _ensure_gfile_for_client(gemini_client, p)
+                    if (not isinstance(p, str) and hasattr(p, "uri")) else p
+                    for p in _payload_list
+                ]
+                _file_refresh_pending = False
+
             current_parts = []
-            for p in (payload if isinstance(payload, list) else [payload]):
+            for p in _payload_list:
                 if isinstance(p, str):
                     current_parts.append(genai_types.Part(text=p))
                 elif hasattr(p, "uri"):
@@ -8370,119 +8918,212 @@ def run_chat_with_rotation(history_obj, payload, system_prompt=None):
             _prompt_tokens = 0
             _output_tokens = 0
             for chunk in response_stream:
+                _piece = None
                 try:
                     if chunk.text:
-                        chunks.append(chunk.text)
-                    # Colectăm usage_metadata din ultimul chunk (Gemini îl include la final)
+                        _piece = chunk.text
                     if hasattr(chunk, "usage_metadata") and chunk.usage_metadata:
                         um = chunk.usage_metadata
-                        if hasattr(um, "prompt_token_count") and um.prompt_token_count:
+                        if getattr(um, "prompt_token_count", None):
                             _prompt_tokens = um.prompt_token_count
-                        if hasattr(um, "candidates_token_count") and um.candidates_token_count:
+                        if getattr(um, "candidates_token_count", None):
                             _output_tokens = um.candidates_token_count
                 except Exception:
                     continue
-            # Actualizăm contoarele per cheie în session_state
-            _key_id = f"_tokens_key_{st.session_state.get('key_index', 0)}"
+                if _piece:
+                    if live_stream:
+                        _started = True
+                        yield _piece
+                    else:
+                        chunks.append(_piece)
+
+            if live_stream and not _started:
+                raise Exception("Modelul nu a returnat niciun text (posibil blocat de filtrele de siguranță).")
+            if not live_stream and not chunks:
+                raise Exception("Modelul nu a returnat niciun text (posibil blocat de filtrele de siguranță).")
+
+            _key_id = f"_tokens_key_{ki}"
             _prev = st.session_state.get(_key_id, {"prompt": 0, "output": 0, "calls": 0})
             st.session_state[_key_id] = {
                 "prompt": _prev["prompt"] + _prompt_tokens,
                 "output": _prev["output"] + _output_tokens,
                 "calls":  _prev["calls"]  + 1,
             }
-
-            # Notă model de rezervă (dar nu pentru modelul de caching care e "normal")
-            if model_name not in (MODEL_WITH_CACHE, MODEL_FALLBACKS_NO_CACHE[0]):
+            if mi > 0:
                 st.toast(f"ℹ️ Răspuns generat cu modelul de rezervă ({model_name})", icon="🔄")
-
-            # Marcăm că caching-ul a funcționat (sau nu) pentru această sesiune
-            st.session_state["_ctx_cache_enabled"] = bool(cached_content_name)
-            # Resetăm contorul de rotații la succes — un apel reușit înseamnă că cheia curentă e OK
-            st.session_state.pop("_quota_rotations", None)
+            if use_cache:
+                st.session_state["_ctx_cache_enabled"] = bool(cached_content_name) if model_name == MODEL_WITH_CACHE \
+                    else st.session_state.get("_ctx_cache_enabled", True)
 
             for text in chunks:
                 yield text
             return
 
         except Exception as e:
-            last_error = e
-            # FIX bug 4: folosim repr(e) + type pentru detecție robustă —
-            # str(e) poate fi gol sau fără codul de eroare pentru unele excepții Google API
+            if _started:
+                raise   # elevul a primit deja o parte din răspuns: o reîncercare ar dubla textul
             error_msg = str(e) + " " + repr(e)
+            _err_low = error_msg.lower()
 
-            # Dacă eroarea vine de la modelul cu caching, dezactivăm caching și reîncercăm
-            # cu modelul normal (nu rotăm cheia — cheia e OK, modelul/caching-ul e problema)
-            _is_cache_model_error = (
-                _use_cache and model_name == MODEL_WITH_CACHE
-                and cached_content_name is None  # caching a eșuat, nu cheia
-                and "400" not in error_msg       # nu e eroare de cheie
+            _is_invalid_key = (
+                "API key not valid" in error_msg or "API_KEY_INVALID" in error_msg
+                or "api_key_invalid" in _err_low or "invalid api key" in _err_low
             )
-            if _is_cache_model_error or (
+            _is_quota = (
+                re.search(r"\b429\b", error_msg) is not None
+                or "quota" in _err_low or "rate_limit" in _err_low or "rate limit" in _err_low
+                or "resource_exhausted" in _err_low
+            )
+            _is_overload = ("503" in error_msg or "overloaded" in _err_low or "unavailable" in _err_low)
+            _is_file_err = _has_gfile and (
+                "access the file" in _err_low or "files/" in _err_low
+                or ("file" in _err_low and any(x in _err_low for x in ("permission_denied", "not_found", "not found")))
+            )
+            _is_missing_model = (not _is_file_err) and (
+                re.search(r"\b404\b", error_msg) is not None or "not_found" in _err_low or "not found" in _err_low
+                or "is not supported for generatecontent" in _err_low
+            )
+
+            # Eroare legată de caching: dezactivăm caching-ul și reîncercăm același model
+            if (
                 _use_cache and model_name == MODEL_WITH_CACHE
-                and ("not supported" in error_msg.lower() or "cach" in error_msg.lower())
+                and not (_is_invalid_key or _is_quota or _is_file_err)
+                and (
+                    (cached_content_name is None and "400" not in error_msg and not _is_overload and not _is_missing_model)
+                    or "not supported" in _err_low
+                    or "cach" in _err_low
+                )
             ):
                 _use_cache = False
                 st.session_state["_ctx_cache_enabled"] = False
-                continue  # reîncearcă cu MODEL_FALLBACKS_NO_CACHE[0]
-
-            # Erori de cheie invalidă (400 API_KEY_INVALID, 429 quota, rate limit) —
-            # tratate toate la fel: invalidăm cache-ul cheii și rotăm
-            _is_key_error = (
-                "API key not valid" in error_msg
-                or "API_KEY_INVALID" in error_msg
-                or "api_key_invalid" in error_msg.lower()
-                or "invalid api key" in error_msg.lower()
-                or "429" in error_msg
-                or "quota" in error_msg.lower()
-                or "rate_limit" in error_msg.lower()
-            )
-
-            if _is_key_error:
-                # Invalidăm cache-ul cheii care tocmai a eșuat
-                _invalidate_cache_for_key(current_key)
-                # Rotăm cheia; dacă am epuizat toate, afișăm mesaj prietenos
-                _quota_key = "_quota_rotations"
-                rotations = st.session_state.get(_quota_key, 0) + 1
-                st.session_state[_quota_key] = rotations
-                if len(keys) <= 1 or rotations >= len(keys):
-                    st.session_state.pop(_quota_key, None)
-                    raise Exception(
-                        "Toate cheile API sunt epuizate sau invalide. "
-                        "Reîncearcă mai târziu sau adaugă o cheie personală în sidebar. 🔑"
-                    )
-                st.session_state.key_index = (st.session_state.key_index + 1) % len(keys)
-                st.toast(f"⚠️ Cheie invalidă/epuizată — schimb la cheia {st.session_state.key_index + 1}...", icon="🔄")
-                time.sleep(0.5)
                 continue
 
-            elif "400" in error_msg:
-                # 400 fără cheie invalidă = cerere malformată — nu are sens să reîncercăm
+            if _is_file_err and not (_is_invalid_key or _is_quota) and _file_refreshes < 2 \
+                    and st.session_state.get("_gsrc_map"):
+                _file_refreshes += 1
+                _file_refresh_pending = True
+                continue
+
+            if _is_invalid_key:
+                _last_kind = "invalid"
+                _invalidate_cache_for_key(current_key)
+                _quota_block(current_key, None, time.time() + 3600)
+                _log(f"[AI] cheia {ki + 1} invalidă — ocolită 1 oră", "silent")
+                continue
+
+            if _is_quota:
+                _last_kind = "quota"
+                _until = _quota_until_from_error(error_msg)
+                _quota_block(current_key, model_name, _until)
+                _log(f"[AI] cota epuizată: cheia {ki + 1} / {model_name} — ocolită "
+                     f"{int((_until - time.time()) / 60)} min", "silent")
+                st.toast(f"⚠️ Limită atinsă pe {model_name} — încerc altă variantă...", icon="🔄")
+                continue
+
+            if _is_missing_model:
+                _last_kind = "missing"
+                _quota_block(None, model_name, time.time() + 6 * 3600)
+                _log(f"[AI] modelul {model_name} nu e disponibil — scos din lanț 6 ore", "silent", e)
+                continue
+
+            if "400" in error_msg:
                 raise Exception(f"❌ Cerere invalidă (400): {error_msg}") from e
 
-            elif "503" in error_msg or "overloaded" in error_msg.lower() or "resource_exhausted" in error_msg.lower():
+            if _is_overload:
+                _last_kind = "overload"
+                _quota_block(current_key, model_name, time.time() + 30)
                 if time.time() >= _deadline:
                     raise Exception(
                         "Serviciul AI este supraîncărcat. Te rugăm să încerci din nou în câteva secunde. 🐢"
                     ) from e
-                wait = min(0.5 * (2 ** attempt), 5)
-                st.toast("🐢 Server ocupat, reîncerc...", icon="⏳")
-                time.sleep(wait)
+                st.toast(f"🐢 {model_name} ocupat — încerc altă variantă...", icon="⏳")
+                time.sleep(0.5)
                 continue
 
-            else:
-                raise e
+            raise e
 
-    st.session_state.pop("_quota_rotations", None)  # Resetare la epuizare completă
-    friendly_msg = (
+    raise Exception(
         "Ne pare rău, serviciul AI este momentan supraîncărcat. "
-        "Te rugăm să încerci din nou în câteva secunde. "
-        "Dacă problema persistă, verifică cheia API sau încearcă mai târziu. 🙏"
+        "Te rugăm să încerci din nou în câteva secunde. 🙏"
     )
-    raise Exception(friendly_msg)
+
+
+MAX_UPLOAD_FILES = 10
+
+
+def _get_or_upload_gfile(uploaded_file):
+    """Google File pentru o imagine/PDF: din cache (dacă e încă valid) sau urcat acum. None la eroare."""
+    file_key = f"_gfile_{uploaded_file.name}_{uploaded_file.size}"
+    cached_gf = st.session_state.get(file_key)
+    if cached_gf:
+        try:
+            gemini_client = genai.Client(api_key=keys[st.session_state.key_index])
+            refreshed = gemini_client.files.get(name=cached_gf.name)
+            if _is_gfile_active(refreshed) or getattr(refreshed.state, "name", "") == "PROCESSING" \
+                    or str(refreshed.state) in ("FileState.PROCESSING", "PROCESSING"):
+                return refreshed
+        except Exception:
+            pass   # expirat pe Google (TTL 48h) sau altă cheie/proiect → îl re-urcăm
+        st.session_state.pop(file_key, None)
+
+    file_type = uploaded_file.type or "application/octet-stream"
+    suffix = {"image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+              "image/gif": ".gif", "application/pdf": ".pdf"}.get(file_type, ".bin")
+    spinner_text = (f"🖼️ Se trimite imaginea {uploaded_file.name}..." if file_type.startswith("image/")
+                    else f"📚 Se trimite documentul {uploaded_file.name}...")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+        gemini_client = genai.Client(api_key=keys[st.session_state.key_index])
+        with st.spinner(spinner_text):
+            gfile = gemini_client.files.upload(file=tmp_path, config=genai_types.UploadFileConfig(mime_type=file_type))
+            poll = 0
+            while str(gfile.state) in ("FileState.PROCESSING", "PROCESSING") and poll < 60:
+                time.sleep(1)
+                gfile = gemini_client.files.get(name=gfile.name)
+                poll += 1
+        if _is_gfile_active(gfile):
+            st.session_state[file_key] = gfile
+            return gfile
+        st.error(f"❌ {uploaded_file.name} nu a putut fi procesat "
+                 f"(stare: {getattr(gfile.state, 'name', str(gfile.state))})")
+    except Exception as e:
+        _log("Eroare la încărcarea fișierului", "silent", e)
+        st.error(f"❌ {uploaded_file.name} nu a putut fi încărcat. Verifică formatul și dimensiunea.")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    return None
+
+
+def _remove_attached_file(name: str, size: int, is_media: bool):
+    """Callback „🗑️”: scoate un fișier din atașamente (și îl șterge de pe Google, dacă e imagine/PDF)."""
+    fid = f"{name}_{size}"
+    st.session_state.setdefault("_removed_file_keys", set()).add(fid)
+    st.session_state.pop(f"_txtcache_{fid}", None)
+    gf = st.session_state.pop(f"_gfile_{fid}", None) if is_media else None
+    if gf:
+        try:
+            genai.Client(api_key=keys[st.session_state.key_index]).files.delete(name=gf.name)
+        except Exception as _e:
+            _log(f"Nu s-a putut șterge fișierul Google Files API: {_e}", "silent")
 
 
 # === UI PRINCIPAL ===
-st.title("🎓 aiProfesor Liceu")
+st.title("🎓 Profesor Liceu")
+comercial.ui.render_ai_notice()   # AI Act art. 50: elevul știe că vorbește cu un AI
+_plata = st.query_params.get("plata", "")
+if _plata:
+    if _plata == "ok":
+        st.success("✅ Plata a fost înregistrată. Abonamentul se activează în câteva secunde.")
+    else:
+        st.info("Plata a fost anulată. Poți încerca oricând din bara laterală (👤 Cont → ⭐ Abonament).")
+    try:
+        del st.query_params["plata"]
+    except Exception:
+        pass
 
 # Afișăm materia selectată mic sub titlu
 if st.session_state.get("pedagogie_mode"):
@@ -8493,48 +9134,15 @@ else:
         _mat_label = next((k for k, v in MATERII.items() if v == _mat_curenta), _mat_curenta)
         st.caption(f"Materie selectată: **{_mat_label}**")
 
-
 with st.sidebar:
-    st.header("⚙️ Opțiuni")
-
-    # ── Autentificare ──
-    st.subheader("🔑 Cont")
-    render_auth_sidebar()
+    _render_account_ui()
     st.divider()
 
-    # Admin panel — vizibil doar pentru admini
-    if auth_is_admin():
-        if st.button("👑 Admin Panel", use_container_width=True, key="admin_panel_btn",
-                     type="primary" if st.session_state.get("_show_admin") else "secondary"):
-            st.session_state["_show_admin"] = not st.session_state.get("_show_admin", False)
-            st.rerun()
-        if st.session_state.get("_show_admin"):
-            render_admin_panel()
-        st.divider()
+    st.header("⚙️ Opțiuni")
 
     # --- Selector materie ---
     st.subheader("📚 Materie")
-
-    # Dacă utilizatorul e logat și are profil/materii salvate,
-    # afișăm DOAR materiile relevante pentru profilul lui + opțiunea Automat
-    _profile_materii = get_materii_for_profile()
-    if _profile_materii:
-        # Păstrăm ordinea din MATERII, filtrăm la cele din profil
-        _materii_keys = ["🤖 Automat"] + [
-            m for m in list(MATERII.keys())
-            if m in _profile_materii and m != "🤖 Automat"
-        ]
-    else:
-        _materii_keys = list(MATERII.keys())
-
-    # Dacă materia curentă nu mai există în lista filtrată, resetăm la Automat
-    _mat_saved = st.session_state.get("materie_selectata")
-    _mat_in_list = any(MATERII.get(k) == _mat_saved for k in _materii_keys)
-    if _mat_saved is not None and not _mat_in_list:
-        st.session_state["materie_selectata"] = None
-        st.session_state.pop("_detected_subject", None)
-        st.session_state.pop("system_prompt", None)
-        _mat_saved = None
+    _materii_keys = list(MATERII.keys())
     _mat_saved = st.session_state.get("materie_selectata")
     _mat_default_idx = next(
         (i for i, k in enumerate(_materii_keys) if MATERII[k] == _mat_saved),
@@ -8561,7 +9169,8 @@ with st.sidebar:
                 pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                 mod_avansat=st.session_state.get("mod_avansat", False),
                 mod_strategie=st.session_state.get("mod_strategie", False),
-                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+            )
         else:
             # Mod manual — selectorul are prioritate absolută
             st.session_state["_detected_subject"] = materie_selectata
@@ -8571,7 +9180,8 @@ with st.sidebar:
                 pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                 mod_avansat=st.session_state.get("mod_avansat", False),
                 mod_strategie=st.session_state.get("mod_strategie", False),
-                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+            )
         # Forțăm rerun explicit — necesar pe mobil unde sidebar-ul nu declanșează
         # automat rerender-ul paginii principale după schimbare de materie
         st.rerun()
@@ -8620,7 +9230,8 @@ with st.sidebar:
             for _k in ["bac_mode", "bac_active", "bac_materie", "bac_profil", "bac_subject",
                        "bac_barem", "bac_raspuns", "bac_corectat", "bac_corectare",
                        "bac_start_time", "bac_timp_min", "bac_from_photo", "bac_ocr_done",
-                       "bac_timer_submitted", "homework_mode", "hw_materie", "hw_text",
+                       "bac_timer_submitted", "bac_use_timer", "bac_show_barem",  # FIX Bug #2
+                       "homework_mode", "hw_materie", "hw_text",
                        "hw_corectare", "hw_done", "hw_from_photo", "hw_ocr_done",
                        "quiz_mode", "quiz_active", "quiz_questions", "quiz_correct",
                        "quiz_answers", "quiz_submitted", "quiz_materie", "quiz_nivel",
@@ -8633,7 +9244,8 @@ with st.sidebar:
                 pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                 mod_avansat=st.session_state.get("mod_avansat", False),
                 mod_strategie=st.session_state.get("mod_strategie", False),
-                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+            )
             invalidate_session_cache()
             components.html(
                 f"<script>localStorage.setItem('profesor_session_id', {json.dumps(_ped_sid)});</script>",
@@ -8664,7 +9276,8 @@ with st.sidebar:
                     pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                     mod_avansat=st.session_state.get("mod_avansat", False),
                     mod_strategie=st.session_state.get("mod_strategie", False),
-                    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                )
                 # FIX 3: actualizăm și URL-ul ?sid= — altfel la refresh se restaurează SID-ul de pedagogie
                 try:
                     st.query_params["sid"] = _prev_sid
@@ -8687,7 +9300,8 @@ with st.sidebar:
                     pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                     mod_avansat=st.session_state.get("mod_avansat", False),
                     mod_strategie=st.session_state.get("mod_strategie", False),
-                    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                    mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                )
                 # FIX 3b: actualizăm URL-ul și localStorage la sesiunea nouă
                 try:
                     st.query_params["sid"] = _new_main_sid
@@ -8722,7 +9336,8 @@ with st.sidebar:
             pas_cu_pas=pas_cu_pas,
             mod_avansat=st.session_state.get("mod_avansat", False),
             mod_strategie=st.session_state.get("mod_strategie", False),
-            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+        )
         if pas_cu_pas:
             st.toast("🔢 Mod Pas cu Pas activat!", icon="✅")
         else:
@@ -8765,7 +9380,8 @@ with st.sidebar:
             mod_avansat=mod_avansat,
             pas_cu_pas=st.session_state.get("pas_cu_pas", False),
             mod_strategie=st.session_state.get("mod_strategie", False),
-            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+            mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+        )
         st.toast("⚡ Mod Avansat activat!" if mod_avansat else "Mod normal activat.", icon="✅" if mod_avansat else "💬")
         st.rerun()
     if st.session_state.get("mod_avansat"):
@@ -8809,6 +9425,94 @@ with st.sidebar:
 
     st.divider()
 
+    # === DESCĂRCARE CONVERSAȚIE ===
+    _msgs_for_download = st.session_state.get("messages", [])
+    if _msgs_for_download:
+        import datetime as _dt
+
+        def _build_conversation_txt(messages: list) -> str:
+            """Construiește textul conversației pentru descărcare."""
+            _materie = st.session_state.get("materie_selectata") or st.session_state.get("_detected_subject")
+            _materie_label = _MATERII_LABEL.get(_materie, "General") if _materie else "General"
+            _sid_short = st.session_state.session_id[:8]
+            _now = _dt.datetime.now().strftime("%d.%m.%Y %H:%M")
+
+            lines = [
+                "=" * 60,
+                "  PROFESOR VIRTUAL AI — Conversație exportată",
+                "=" * 60,
+                f"  Materie : {_materie_label}",
+                f"  Data    : {_now}",
+                f"  Sesiune : {_sid_short}...",
+                f"  Mesaje  : {len(messages)}",
+                "=" * 60,
+                "",
+            ]
+            for msg in messages:
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if role == "user":
+                    lines.append("👤 ELEV:")
+                elif role == "assistant":
+                    lines.append("🎓 PROFESOR:")
+                else:
+                    lines.append(f"[{role.upper()}]:")
+                # Curățăm marcajele SVG din export — nu au sens în text plain
+                _clean_content = re.sub(r'\[\[DESEN_SVG\]\].*?\[\[/DESEN_SVG\]\]', '[desen SVG]', content, flags=re.DOTALL)
+                _clean_content = re.sub(r'<svg\b.*?</svg\s*>', '[desen SVG]', _clean_content, flags=re.DOTALL | re.IGNORECASE)
+                # Înlocuim marker-ul SRT cu un sumar — traducerea e descărcabilă separat ca .srt
+                _clean_content = re.sub(
+                    r'\[SRT_TRANSLATION_KEY:[^\]]+\]',
+                    '[Traducere SRT completă — descarcă fișierul .srt separat din chat]',
+                    _clean_content
+                )
+                # Fallback pentru formatul vechi cu ```srt
+                _clean_content = re.sub(
+                    r'```srt\n.*?```',
+                    '[Traducere SRT completă — descarcă fișierul .srt separat din chat]',
+                    _clean_content,
+                    flags=re.DOTALL
+                )
+                lines.append(_clean_content.strip())
+                lines.append("-" * 60)
+                lines.append("")
+            lines.append("=" * 60)
+            lines.append("  Export generat de Profesor Virtual AI")
+            lines.append("=" * 60)
+            return "\n".join(lines)
+
+        _conv_text = _build_conversation_txt(_msgs_for_download)
+        _materie_fn = (st.session_state.get("materie_selectata") or "conversatie") or "conversatie"
+        _materie_fn = re.sub(r'[^a-zA-Z0-9_-]', '_', str(_materie_fn))
+        _date_fn = _dt.datetime.now().strftime("%Y%m%d")
+        _filename = f"profesor_ai_{_materie_fn}_{_date_fn}.txt"
+
+        st.download_button(
+            label="💾 Descarcă conversația",
+            data=_conv_text.encode("utf-8"),
+            file_name=_filename,
+            mime="text/plain",
+            use_container_width=True,
+            help="Salvează întreaga conversație ca fișier text (.txt)",
+        )
+
+        # Dacă există o traducere SRT în sesiune, oferim și butonul de descărcare SRT în sidebar
+        _srt_sidebar = None
+        for _sk, _sv in st.session_state.items():
+            if _sk.startswith("_srt_translation_") and isinstance(_sv, dict):
+                _srt_sidebar = _sv
+                break
+        if _srt_sidebar:
+            st.download_button(
+                label=f"⬇️ Descarcă subtitrarea tradusă",
+                data=_srt_sidebar["text"].encode("utf-8"),
+                file_name=_srt_sidebar["filename"],
+                mime="text/plain",
+                use_container_width=True,
+                help=f"{_srt_sidebar['blocks']} replici — {_srt_sidebar['orig_name']}",
+                key="_dl_srt_sidebar",
+            )
+
     if st.button("🗑️ Șterge Istoricul", type="primary"):
         clear_history_db(st.session_state.session_id)
         st.session_state.messages = []
@@ -8818,167 +9522,113 @@ with st.sidebar:
 
     st.header("📁 Materiale")
 
-
-    # Tipuri de fișiere acceptate — imagini + documente
-    # FIX Bug 3: key explicit stabil — previne resetarea widgetului la rerun
-    # (ex: când utilizatorul schimbă materia după ce a încărcat poza)
-    uploaded_file = st.file_uploader(
-        "Încarcă imagine, PDF sau document",
-        type=["jpg", "jpeg", "png", "webp", "gif", "pdf"],
-        help="Imaginile sunt analizate vizual de AI (culori, forme, text, obiecte). PDF-urile sunt citite integral.",
-        key="main_file_uploader"
+    # Mai multe fișiere deodată (accept_multiple_files). Cheie fixă: widgetul își păstrează
+    # valoarea peste rerun-urile programatice (schimbare materie, toggle mod etc.).
+    uploaded_files = st.file_uploader(
+        f"Încarcă fișiere (maxim {MAX_UPLOAD_FILES}: imagini, PDF, Word, text, DBF, subtitrare)",
+        type=["jpg", "jpeg", "png", "webp", "gif", "pdf",
+              "txt", "srt", "docx", "doc", "dbf"],
+        accept_multiple_files=True,
+        help=(
+            "Poți selecta mai multe fișiere deodată (Ctrl/Cmd + click) sau le poți adăuga pe rând. "
+            "Imagini: analizate vizual de AI. PDF: citit integral. "
+            "Word (.docx), text (.txt), subtitrare (.srt), baze de date (.dbf): conținutul e extras și trimis la AI."
+        ),
+        key="_main_file_uploader",
     )
-    # FIX Bug 2: restaurăm media_content din cache dacă există deja un fișier procesat
-    # (evită pierderea pozei la rerun-ul cauzat de schimbarea materiei)
-    media_content = st.session_state.get("_media_content_cache")
+    media_content = None       # LISTA de Google Files trimise la AI (imagini/PDF) sau None
+    text_file_content = None   # textul extras din fișierele text (txt/docx/doc/dbf/srt) sau None
 
-    # ── Uploadăm fișierul pe Google Files API (o singură dată per fișier) ──
-    # FIX Bug 1: dacă utilizatorul tocmai a eliminat fișierul, îl ignorăm.
-    # st.file_uploader nu se poate reseta programatic — widgetul îl reafișează după rerun,
-    # deci blocăm re-uploadul prin cheia _removed_file_key setată la eliminare.
-    if uploaded_file and st.session_state.get("_removed_file_key") == f"{uploaded_file.name}_{uploaded_file.size}":
-        uploaded_file = None  # ignorăm fișierul eliminat
+    _all_files = list(uploaded_files or [])
+    # Fișierele scoase cu „🗑️” rămân în widget (nu se poate reseta programatic) → le ignorăm.
+    _removed_keys = st.session_state.setdefault("_removed_file_keys", set())
+    _present_keys = {f"{f.name}_{f.size}" for f in _all_files}
+    _removed_keys.intersection_update(_present_keys)   # scos și din widget → poate fi adăugat din nou
+    _files = [f for f in _all_files if f"{f.name}_{f.size}" not in _removed_keys]
+    if len(_files) > MAX_UPLOAD_FILES:
+        st.warning(f"⚠️ Am păstrat primele {MAX_UPLOAD_FILES} fișiere; restul sunt ignorate.")
+        _files = _files[:MAX_UPLOAD_FILES]
 
-    if uploaded_file:
-        st.session_state.pop("_removed_file_key", None)  # alt fișier nou → curățăm flag-ul
-        file_key   = f"_gfile_{uploaded_file.name}_{uploaded_file.size}"
-        cached_gf  = st.session_state.get(file_key)
-
-        # Dacă fișierul e deja încărcat și valid pe serverele Google, îl refolosim
-        if cached_gf:
-            try:
-                gemini_client = get_gemini_client(keys[st.session_state.key_index])
-                refreshed = gemini_client.files.get(cached_gf.name)
-                if str(refreshed.state) in ("FileState.ACTIVE", "ACTIVE", "FileState.PROCESSING", "PROCESSING") or getattr(refreshed.state, "name", "") in ("ACTIVE", "PROCESSING"):
-                    media_content = refreshed
-                    st.session_state["_media_content_cache"] = refreshed  # FIX Bug 2: persistăm
-            except Exception:
-                # Fișierul a expirat pe Google (TTL 48h) — îl re-uploadăm
-                st.session_state.pop(file_key, None)
-                cached_gf = None
-
-        if not cached_gf:
-            file_type = uploaded_file.type
-            is_image  = file_type.startswith("image/")
-            is_pdf    = "pdf" in file_type
-
-            # Determină sufixul și mime_type corect
-            suffix_map = {
-                "image/jpeg": ".jpg", "image/jpg": ".jpg",
-                "image/png": ".png",  "image/webp": ".webp",
-                "image/gif": ".gif",  "application/pdf": ".pdf",
-            }
-            suffix    = suffix_map.get(file_type, ".bin")
-            mime_type = file_type
-
-            spinner_text = (
-                "🖼️ Profesorul analizează imaginea..." if is_image
-                else "📚 Se procesează documentul..."
-            )
-
-            try:
-                tmp_path = None
-                try:
-                    file_bytes = uploaded_file.getvalue()
-
-                    # === PDF Enhancement: PyMuPDF pentru documente lungi ===
-                    # Daca PDF-ul e mai mare de pragul configurat, extragem textul local
-                    # (mai rapid si mai fiabil decat uploadul complet la Gemini pentru PDF-uri voluminoase)
-                    if is_pdf and len(file_bytes) > PDF_PYMUPDF_THRESHOLD_BYTES:
-                        with st.spinner("📖 Se extrage textul din PDF (document lung)..."):
-                            extracted_text = _extract_pdf_text_pymupdf(file_bytes)
-                        if extracted_text:
-                            # Stocam textul extras ca "media_content" text in loc de Google File
-                            st.session_state[file_key] = extracted_text
-                            media_content = extracted_text
-                            st.session_state["_media_content_cache"] = extracted_text  # FIX Bug 2
-                            st.session_state["_current_uploaded_file_meta"] = {
-                                "name": uploaded_file.name,
-                                "type": uploaded_file.type,
-                                "size": uploaded_file.size,
-                                "extracted_text": True,
-                            }
-                            st.success(f"✅ **{uploaded_file.name}** procesat local ({len(extracted_text):,} caractere extrase)")
-                            st.caption("📄 Textul complet a fost extras si va fi trimis la AI.")
-                            if st.button("🗑️ Elimina fisierul", use_container_width=True, key="remove_media_pymupdf"):
-                                st.session_state.pop(file_key, None)
-                                media_content = None
-                                st.session_state.pop("_current_uploaded_file_meta", None)
-                                st.session_state.pop("_media_content_cache", None)  # FIX Bug 2
-                                st.session_state["_removed_file_key"] = f"{uploaded_file.name}_{uploaded_file.size}"
-                                st.rerun()
-                            # Sarim peste uploadul la Google Files API
-                            uploaded_file = None  # marcare — nu mai procesam mai jos
-                        # daca extractia a esuat (extracted_text gol), continuam cu uploadul normal
-
-                    if uploaded_file is not None:
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                            tmp.write(file_bytes)
-                            tmp_path = tmp.name
-
-                        gemini_client = get_gemini_client(keys[st.session_state.key_index])
-
-                        with st.spinner(spinner_text):
-                            gfile = gemini_client.files.upload(file=tmp_path, config=genai_types.UploadFileConfig(mime_type=mime_type))
-                            # Așteptăm procesarea (mai rapid pentru imagini, mai lent pentru PDF-uri mari)
-                            poll = 0
-                            while str(gfile.state) in ("FileState.PROCESSING", "PROCESSING") and poll < 60:
-                                time.sleep(1)
-                                gfile = gemini_client.files.get(gfile.name)
-                                poll += 1
-
-                        if _is_gfile_active(gfile):
-                            media_content = gfile
-                            st.session_state[file_key] = gfile  # cache pentru reruns
-                            st.session_state["_media_content_cache"] = gfile  # FIX Bug 2: persistăm pentru rerunuri
-                        else:
-                            st.error(f"❌ Fișierul nu a putut fi procesat (stare: {getattr(gfile.state, 'name', str(gfile.state))})")
-
-                finally:
-                    if tmp_path and os.path.exists(tmp_path):
-                        os.unlink(tmp_path)
-
-            except Exception as e:
-                st.error(f"❌ Eroare la încărcarea fișierului: {e}")
-
-        # ── Preview în sidebar ──
-        if media_content and uploaded_file:
-            # FIX: salvăm metadatele în session_state pentru acces ulterior (scope safety)
-            # FIX BUG 4: verificăm că uploaded_file nu e None (ramura PyMuPDF îl setează None)
-            st.session_state["_current_uploaded_file_meta"] = {
-                "name": uploaded_file.name,
-                "type": uploaded_file.type,
-                "size": uploaded_file.size,
-            }
-            file_type = uploaded_file.type
-            is_image  = file_type.startswith("image/")
-
-            if is_image:
-                st.image(uploaded_file, caption=f"🖼️ {uploaded_file.name}", use_container_width=True)
-                st.success("✅ Imaginea e pe serverele Google — AI-ul o vede complet (culori, forme, text, obiecte).")
+    if not _files:
+        # Nimic atașat (scos cu X sau cu 🗑️) → nu mai trimitem nimic la AI.
+        for _k in ("_current_uploaded_file_meta", "_active_gfile_keys", "_active_textcache_keys"):
+            st.session_state.pop(_k, None)
+    else:
+        _media_list, _text_parts, _metas = [], [], []
+        _gkeys, _tkeys, _gsrc = [], [], {}
+        for _uf in _files:
+            _fid = f"{_uf.name}_{_uf.size}"
+            _meta = {"name": _uf.name, "type": _uf.type or "", "size": _uf.size}
+            if _is_text_file(_uf):
+                _tkey = f"_txtcache_{_fid}"
+                _txt = st.session_state.get(_tkey)
+                if _txt is None:
+                    with st.spinner(f"📄 Se extrage conținutul din {_uf.name}..."):
+                        _txt = _extract_text_from_uploaded_file(_uf)
+                    if _txt:
+                        st.session_state[_tkey] = _txt
+                    else:
+                        st.error(f"❌ Nu s-a putut extrage textul din {_uf.name}.")
+                if _txt:
+                    _text_parts.append((_uf.name, _txt))
+                    _metas.append(_meta)
+                    _tkeys.append(_tkey)
             else:
-                st.success(f"✅ **{uploaded_file.name}** încărcat ({uploaded_file.size // 1024} KB)")
-                st.caption("📄 AI-ul poate citi și analiza tot conținutul documentului.")
+                _gf = _get_or_upload_gfile(_uf)
+                if _gf:
+                    _media_list.append(_gf)
+                    _metas.append(_meta)
+                    _gkeys.append(f"_gfile_{_fid}")
+                    _bytes = _uf.getvalue()
+                    if len(_bytes) <= 25 * 1024 * 1024:   # pentru re-upload la rotația cheilor
+                        _gsrc[_gf.name] = (_bytes, _uf.type)
 
-            # Buton de ștergere — curăță și de pe Google
-            if st.button("🗑️ Elimină fișierul", use_container_width=True, key="remove_media"):
-                file_key = f"_gfile_{uploaded_file.name}_{uploaded_file.size}"
-                gf = st.session_state.pop(file_key, None)
-                if gf:
-                    try:
-                        gemini_client = get_gemini_client(keys[st.session_state.key_index])
-                        gemini_client.files.delete(gf.name)
-                        _log("Fișier eliminat de pe Google Files API.", "info")
-                    except Exception as _e:
-                        _log(f"Nu s-a putut șterge fișierul Google Files API: {_e}", "silent")
-                media_content = None
-                st.session_state.pop("_current_uploaded_file_meta", None)
-                st.session_state.pop("_media_content_cache", None)  # FIX Bug 2
-                # FIX Bug 1: marcăm fișierul ca "de ignorat" — după rerun, widget-ul
-                # st.file_uploader încă returnează fișierul (nu se poate reseta programatic),
-                # deci blocăm re-uploadul prin cheie de excludere.
-                st.session_state["_removed_file_key"] = f"{uploaded_file.name}_{uploaded_file.size}"
-                st.rerun()
+        if _media_list:
+            media_content = _media_list
+            st.session_state["_gsrc_map"] = _gsrc
+        if _text_parts:
+            text_file_content = (
+                _text_parts[0][1] if len(_text_parts) == 1
+                else "\n\n".join(f"=== FIȘIER: {n} ===\n{t}" for n, t in _text_parts)
+            )
+        if _metas:
+            st.session_state["_current_uploaded_file_meta"] = (
+                _metas[0] if len(_metas) == 1 else
+                {"name": f"{len(_metas)} fișiere", "type": "multi", "size": sum(m["size"] for m in _metas),
+                 "files": _metas}
+            )
+        st.session_state["_active_gfile_keys"] = _gkeys
+        st.session_state["_active_textcache_keys"] = _tkeys
+
+        # ── Lista fișierelor atașate, fiecare cu buton de eliminare ──
+        st.caption(f"📎 {len(_metas)} fișier(e) atașat(e) — se trimit la AI împreună cu întrebarea ta.")
+        for _uf in _files:
+            _fid = f"{_uf.name}_{_uf.size}"
+            _is_txt = _is_text_file(_uf)
+            _ok = (_fid in [k.replace("_txtcache_", "", 1) for k in _tkeys]) if _is_txt \
+                else (f"_gfile_{_fid}" in _gkeys)
+            if not _ok:
+                continue
+            _ico = ("🖼️" if (_uf.type or "").startswith("image/") else "📕" if "pdf" in (_uf.type or "")
+                    else "🎬" if _uf.name.lower().endswith(".srt") else "🗄️" if _uf.name.lower().endswith(".dbf")
+                    else "📝" if _uf.name.lower().endswith((".docx", ".doc")) else "📄")
+            _c1, _c2 = st.columns([5, 1])
+            with _c1:
+                _extra = (f"{len(st.session_state.get('_txtcache_' + _fid, '')):,} caractere" if _is_txt
+                          else f"{max(1, _uf.size // 1024)} KB")
+                st.markdown(f"{_ico} **{_uf.name}**  \n<small>{_extra}</small>", unsafe_allow_html=True)
+            with _c2:
+                st.button("🗑️", key=f"_rm_file_{_fid}", help=f"Elimină {_uf.name}",
+                          on_click=_remove_attached_file, args=(_uf.name, _uf.size, not _is_txt))
+            if (_uf.type or "").startswith("image/"):
+                try:
+                    st.image(_uf, use_container_width=True)
+                except Exception:
+                    st.caption("(previzualizare indisponibilă pentru această imagine)")
+            elif _is_txt and not st.session_state.get("_txtcache_" + _fid, "").startswith("⚠️"):
+                with st.expander("👁️ Previzualizare", expanded=False):
+                    _t = st.session_state.get("_txtcache_" + _fid, "")
+                    st.text(_t[:300] + ("\n..." if len(_t) > 300 else ""))
 
     st.divider()
 
@@ -8990,10 +9640,10 @@ with st.sidebar:
         "bac_mode", "bac_active", "bac_materie", "bac_profil", "bac_subject",
         "bac_barem", "bac_raspuns", "bac_corectat", "bac_corectare",
         "bac_start_time", "bac_timp_min", "bac_from_photo", "bac_ocr_done",
-        "bac_timer_submitted",
+        "bac_timer_submitted", "bac_use_timer", "bac_show_barem",  # FIX Bug #2: adăugate
     ]
     _HW_KEYS = [
-        "homework_mode", "hw_materie", "hw_text", "hw_corectare",
+        "homework_mode", "hw_materie", "hw_text", "hw_text_input", "hw_corectare",
         "hw_done", "hw_from_photo", "hw_ocr_done",
     ]
     _QUIZ_KEYS = [
@@ -9063,6 +9713,11 @@ with st.sidebar:
             _my_sids.append(new_sid)
         st.session_state["_my_session_ids"] = _my_sids
         switch_session(new_sid)
+        # FIX PERSISTENȚĂ (v2): nu mai e nevoie de ?new=1 — switch_session() setează
+        # deja st.session_state["session_id"], iar get_or_create_session_id() îl
+        # găsește acolo la următorul run și îl scrie direct în ?sid=, fără să mai
+        # treacă vreodată prin gate-ul de verificare localStorage (acela rulează
+        # DOAR când URL-ul e complet curat și session_state nu are niciun SID).
         st.rerun()
 
     # Afișează DOAR sesiunile create de acest browser în această sesiune Streamlit
@@ -9077,16 +9732,18 @@ with st.sidebar:
     sessions = []
     try:
         _supabase = get_supabase_client()
-        _resp = (
+        _q = (
             _supabase.table("session_previews")
             .select("session_id, last_active, msg_count, preview")
             .eq("app_id", get_app_id())
-            .in_("session_id", _my_sids)
-            .gt("msg_count", 0)
-            .order("last_active", desc=True)
-            .limit(15)
-            .execute()
         )
+        if current_user_id():
+            # Cu cont: toate conversațiile contului, de pe orice device
+            _q = _q.eq("liceu_user_id", current_user_id())
+        else:
+            # Fără cont: doar conversațiile anonime ale acestui browser
+            _q = _q.in_("session_id", _my_sids).is_("liceu_user_id", "null")
+        _resp = _q.gt("msg_count", 0).order("last_active", desc=True).limit(30 if current_user_id() else 15).execute()
         sessions = _resp.data or []
     except Exception:
         pass
@@ -9134,7 +9791,7 @@ with st.sidebar:
     if _debug_checked:
         msg_count = len(st.session_state.get("messages", []))
         st.caption(f"📊 Mesaje în memorie: {msg_count}/{MAX_MESSAGES_IN_MEMORY}")
-        st.caption(f"🔑 Cheie API activă: {st.session_state.key_index + 1}/{len(keys)}")
+        st.caption(f"🔑 Cheie API activă: {st.session_state.key_index + 1}/{len(keys)} · {quota_status_text()}")
 
         # ── Statistici token usage per cheie (sesiunea curentă) ──
         # Notă: Gemini Free tier = 1.500 req/zi și 1.000.000 token/min per cheie.
@@ -9168,26 +9825,36 @@ with st.sidebar:
 
         st.caption(f"🆔 Sesiune: {st.session_state.session_id[:16]}...")
 
+    # Datele firmei, ANPC/SAL și documentele legale — mereu la finalul barei laterale
+    comercial.ui.render_footer()
+
+
+# Versiunea comercială: fără cont / acord parental / documente acceptate / abonament → ecranul de acces
+_ent = comercial.billing.entitlement(current_user())
+if not _ent["ok"]:
+    comercial.ui.render_gate(_ent, current_user())   # se oprește singură (st.stop)
 
 # === MAIN UI — TEME / BAC / QUIZ / CHAT ===
-if st.session_state.get("homework_mode"):
-    run_homework_ui()
+def _run_mode(fn):
+    """Rulează un mod (temă/admitere/BAC/quiz); limita zilnică atinsă apare ca mesaj, nu ca eroare."""
+    try:
+        fn()
+    except comercial.core.AccessError as _ae:
+        st.warning(str(_ae))
     st.stop()
+
+
+if st.session_state.get("homework_mode"):
+    _run_mode(run_homework_ui)
 
 if st.session_state.get("admitere_mode"):
-    if require_auth_for_premium("Admitere Facultate"):
-        run_admitere_ui()
-    st.stop()
+    _run_mode(run_admitere_ui)
 
 if st.session_state.get("bac_mode"):
-    if require_auth_for_premium("Simulare BAC"):
-        run_bac_sim_ui()
-    st.stop()
+    _run_mode(run_bac_sim_ui)
 
 if st.session_state.get("quiz_mode"):
-    if require_auth_for_premium("Quiz rapid"):
-        run_quiz_ui()
-    st.stop()
+    _run_mode(run_quiz_ui)
 
 # === ÎNCĂRCARE MESAJE (CHAT MODE) ===
 # Încărcăm istoricul dacă: nu există messages, sau messages aparțin altei sesiuni
@@ -9200,6 +9867,43 @@ if (
     st.session_state.messages = _loaded_msgs
     st.session_state["_messages_for_sid"] = _current_sid
     st.session_state.pop("_history_may_be_incomplete", None)
+
+    # ── Restaurare traduceri SRT din istoricul încărcat ──
+    # La refresh, session_state se șterge. Restaurăm traducerile SRT din mesajele
+    # speciale role="srt_data" salvate în Supabase la momentul traducerii.
+    try:
+        _sb_restore = get_supabase_client()
+        if _sb_restore:
+            _srt_rows = (
+                _sb_restore.table("history")
+                .select("content")
+                .eq("session_id", _current_sid)
+                .eq("app_id", get_app_id())
+                .eq("role", "srt_data")
+                .execute()
+            )
+            for _row in (_srt_rows.data or []):
+                _rc = _row.get("content", "")
+                _hdr = re.match(r'\[SRT_DATA:(_srt_translation_[^\]]+)\]\n', _rc)
+                if not _hdr:
+                    continue
+                _rkey  = _hdr.group(1)
+                _rtext = _rc[_hdr.end():]
+                if not _rtext.strip():
+                    continue
+                if st.session_state.get(_rkey):
+                    continue  # deja restaurat
+                _orig_r  = _rkey.replace("_srt_translation_", "", 1)
+                _trad_r  = re.sub(r'\.srt$', '_RO.srt', _orig_r, flags=re.IGNORECASE)
+                _blks_r  = _rtext.count("\n\n") + 1
+                st.session_state[_rkey] = {
+                    "text":      _rtext,
+                    "filename":  _trad_r,
+                    "orig_name": _orig_r,
+                    "blocks":    _blks_r,
+                }
+    except Exception:
+        pass  # restaurarea SRT e best-effort — nu blocăm aplicația
 
     # ── Restaurare materie din istoricul încărcat ──
     # Dacă sesiunea are mesaje dar materia nu e setată (ex: după switch_session),
@@ -9234,8 +9938,6 @@ if (
                 st.session_state[_sum_sid_key] = st.session_state.session_id
                 st.toast("✅ Contextul conversației anterioare a fost reîncărcat!", icon="🧠")
 
-
-
 # Banner mod Pas cu Pas
 if st.session_state.get("pas_cu_pas"):
     st.markdown(
@@ -9251,7 +9953,32 @@ if st.session_state.get("pas_cu_pas"):
 for i, msg in enumerate(st.session_state.messages):
     with st.chat_message(msg["role"]):
         if msg["role"] == "assistant":
-            render_message_with_svg(msg["content"])
+            content = msg["content"]
+            # Detectăm mesajele de traducere SRT după marker-ul compact
+            _srt_key_match = re.search(r'\[SRT_TRANSLATION_KEY:([^\]]+)\]', content)
+            if _srt_key_match:
+                _srt_key = _srt_key_match.group(1)
+                _srt_data = st.session_state.get(_srt_key)
+                # Afișăm prima linie (sumarul) fără marker
+                first_line = content.split("\n")[0]
+                st.markdown(first_line)
+                if _srt_data:
+                    st.download_button(
+                        label="⬇️ Descarcă subtitrarea tradusă (.srt)",
+                        data=_srt_data["text"].encode("utf-8"),
+                        file_name=_srt_data["filename"],
+                        mime="text/plain",
+                        use_container_width=True,
+                        key=f"_dl_srt_hist_{i}",
+                    )
+                    # Afișăm TOT textul tradus — fără trunchiere
+                    st.text(_srt_data["text"])
+                else:
+                    st.caption("⚠️ Traducerea nu mai este disponibilă în această sesiune (sesiunea a fost reîncărcată). Retrimite fișierul pentru a traduce din nou.")
+            else:
+                render_message_with_svg(content)
+            # Raportarea unui răspuns AI greșit/nepotrivit (verificat de admin în „👑 Administrare”)
+            comercial.ui.render_report_button(i, content, st.session_state.get("session_id"), current_user_id())
         else:
             st.markdown(msg["content"])
 
@@ -9283,13 +10010,6 @@ TYPING_HTML = """
 """
 
 if st.session_state.get("_quick_action"):
-    # --- Rate Limiting ---
-    _rl_allowed, _rl_msg = check_rate_limit()
-    if not _rl_allowed:
-        st.session_state.pop("_quick_action", None)
-        st.error(_rl_msg)
-        st.stop()
-
     action = st.session_state.pop("_quick_action")
     # FIX Bug 2: _quick_action_ref nu era setat nicăieri — eliminat, nu mai e necesar
     # (context-ul vine direct din ultimul mesaj al asistentului/utilizatorului)
@@ -9389,12 +10109,13 @@ if st.session_state.get("_quick_action"):
                 message_placeholder.empty()
                 _is_key_err = any(x in str(e) for x in ["epuizat", "invalide", "quota", "429", "API key"])
                 if _is_key_err:
-                    st.warning("⚠️ Cheia API s-a epuizat. Cheia a fost schimbată — apasă **Reîncercați**.", icon="🔑")
-                    if st.button("🔄 Reîncercați răspunsul", key="_retry_quick_action", type="primary"):
-                        st.session_state["_pending_retry"] = True
-                        st.rerun()
+                    _show_ai_error(e, "acțiune rapidă")
+                    # on_click: butonul nu mai e randat la rerun-ul de după click (blocul e one-shot),
+                    # deci un `if st.button(...)` nu s-ar declanșa niciodată; callback-ul rulează oricum.
+                    st.button("🔄 Reîncercați răspunsul", key="_retry_quick_action", type="primary",
+                              on_click=_request_retry)
                 else:
-                    st.error(f"❌ Eroare: {e}")
+                    _show_ai_error(e, "acțiune rapidă")
     st.stop()
 
 # ── Handler mesaj în așteptare — materie nedetectată în mod Automat ──
@@ -9503,7 +10224,7 @@ if st.session_state.get("_suggested_question"):
             st.session_state.messages.append({"role": "assistant", "content": full_response})
             save_message_with_limits(st.session_state.session_id, "assistant", full_response)
         except Exception as e:
-            st.error(f"❌ Eroare: {e}")
+            _show_ai_error(e, "întrebare sugerată")
     st.rerun()
 
 # ── Întrebări sugerate per materie — afișate doar când chat-ul e gol ──
@@ -9796,7 +10517,8 @@ if not st.session_state.get("messages") and not st.session_state.get("pedagogie_
                         pas_cu_pas=st.session_state.get("pas_cu_pas", False),
                         mod_avansat=st.session_state.get("mod_avansat", False),
                         mod_strategie=st.session_state.get("mod_strategie", False),
-                        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False))
+                        mod_bac_intensiv=st.session_state.get("mod_bac_intensiv", False),
+                    )
                     st.rerun()
     else:
         # Materie selectată — afișăm întrebări sugerate pentru materia respectivă
@@ -9845,6 +10567,14 @@ if st.session_state.pop("_pending_retry", False):
     _retry_history  = st.session_state.get("_retry_history")
     _retry_payload  = st.session_state.get("_retry_payload")
     if _retry_history is not None and _retry_payload is not None:
+        if media_content:
+            # Payload-ul salvat poate conține fișiere urcate cu o cheie veche; sidebar-ul tocmai
+            # le-a verificat/re-urcat cu cheia curentă, deci le înlocuim (în ordine) cu versiunile actuale.
+            _cur_media = iter(media_content if isinstance(media_content, list) else [media_content])
+            _retry_payload = [
+                next(_cur_media, _p) if (not isinstance(_p, str) and hasattr(_p, "uri")) else _p
+                for _p in _retry_payload
+            ]
         with st.chat_message("assistant"):
             _rph = st.empty()
             _rph.markdown(TYPING_HTML, unsafe_allow_html=True)
@@ -9864,16 +10594,14 @@ if st.session_state.pop("_pending_retry", False):
                 st.session_state.pop("_retry_payload", None)
             except Exception as _re:
                 _rph.empty()
-                st.error(f"❌ Eroare și la reîncercare: {_re}")
+                _show_ai_error(_re, "reîncercare")
     st.stop()
 
 # === CHAT INPUT ===
 if user_input := st.chat_input("Întreabă profesorul..."):
 
-    # --- Rate Limiting pe IP/sesiune ---
-    _rl_allowed, _rl_msg = check_rate_limit()
-    if not _rl_allowed:
-        st.error(_rl_msg)
+    # --- Rate limiting (minut + zi per sesiune + global) ---
+    if not enforce_rate_limit():
         st.stop()
 
     # --- Debounce: blochează mesaje duplicate trimise rapid ---
@@ -9895,9 +10623,46 @@ if user_input := st.chat_input("Întreabă profesorul..."):
     st.session_state.messages.append({"role": "user", "content": user_input})
     save_message_with_limits(st.session_state.session_id, "user", user_input)
 
+    # FIX PERSISTENȚĂ FIȘIER: dacă media_content/text_file_content sunt None
+    # (ex: widgetul st.file_uploader și-a pierdut valoarea după un rerun programatic —
+    # schimbare materie, toggle mod etc.), recuperăm fișierul activ direct din
+    # session_state, folosind cheia salvată la upload. Fișierul de pe Google rămâne
+    # valid (TTL 48h) și textul extras local rămâne în cache — doar referința locală
+    # `uploaded_file` se pierdea. Trebuie făcut ÎNAINTE de detecția de materie de mai
+    # jos, care depinde de text_file_content.
+    if not media_content:
+        _rec_media = []
+        for _k in st.session_state.get("_active_gfile_keys", []) or []:
+            _gf_check = st.session_state.get(_k)
+            try:
+                if _gf_check and _is_gfile_active(_gf_check):
+                    _rec_media.append(_gf_check)
+            except Exception:
+                pass
+        media_content = _rec_media or None
+
+    if not text_file_content:
+        _rec_txt = [st.session_state.get(_k) for _k in (st.session_state.get("_active_textcache_keys", []) or [])]
+        _rec_txt = [t for t in _rec_txt if t]
+        if len(_rec_txt) == 1:
+            text_file_content = _rec_txt[0]
+        elif _rec_txt:
+            text_file_content = "\n\n".join(_rec_txt)
+
     # ── Detecție și routing materie ──
     _materie_manuala = st.session_state.get("materie_selectata")  # None = mod Automat
     _mod_automat = (_materie_manuala is None)
+
+    # Dacă elevul a încărcat un fișier text (SRT, docx, txt, dbf), mesajul descrie
+    # o operație pe fișier ("traduce din engleză în română", "rezumă", etc.) și conține
+    # cuvinte-cheie de limbi/materii care ar declanșa fals detecția.
+    # Excludem complet detecția de materie în acest caz.
+    _ufm = st.session_state.get("_current_uploaded_file_meta", {}) or {}
+    _has_text_file_uploaded = bool(
+        (_ufm.get("type") == "multi"
+         or _ufm.get("name", "").lower().split(".")[-1] in ("srt", "txt", "docx", "doc", "dbf"))
+        and text_file_content  # fișierul chiar a fost încărcat și extras
+    )
 
     if not _mod_automat:
         # Mod manual: selectorul are prioritate — asigurăm prompt-ul corect
@@ -9905,21 +10670,24 @@ if user_input := st.chat_input("Întreabă profesorul..."):
             update_system_prompt_for_subject(_materie_manuala)
         # FIX Bug 3: avertizăm dacă textul pare să fie pentru altă materie
         # (detectăm din mesaj, comparăm cu selecția manuală — toast non-blocant)
-        _detected_in_msg = detect_subject_from_text(user_input)
-        if (
-            _detected_in_msg
-            and _detected_in_msg != _materie_manuala
-            and _detected_in_msg != "pedagogie"
-            and not st.session_state.get(f"_mismatch_warned_{st.session_state.session_id}")
-        ):
-            _sel_label = _MATERII_LABEL.get(_materie_manuala, _materie_manuala or "materia selectată")
-            _det_label = _MATERII_LABEL.get(_detected_in_msg, _detected_in_msg.capitalize())
-            st.toast(
-                f"💡 Mesajul pare să fie despre {_det_label}, dar ești pe {_sel_label}. "
-                f"Schimbă materia din sidebar dacă vrei răspuns specializat.",
-                icon="⚠️"
-            )
-            st.session_state[f"_mismatch_warned_{st.session_state.session_id}"] = True
+        # EXCEPȚIE: dacă e un fișier text încărcat, nu avertizăm — mesajul conține
+        # inevitabil cuvinte de limbi/materii (ex: "traduce din engleză în română")
+        if not _has_text_file_uploaded:
+            _detected_in_msg = detect_subject_from_text(user_input)
+            if (
+                _detected_in_msg
+                and _detected_in_msg != _materie_manuala
+                and _detected_in_msg != "pedagogie"
+                and not st.session_state.get(f"_mismatch_warned_{st.session_state.session_id}")
+            ):
+                _sel_label = _MATERII_LABEL.get(_materie_manuala, _materie_manuala or "materia selectată")
+                _det_label = _MATERII_LABEL.get(_detected_in_msg, _detected_in_msg.capitalize())
+                st.toast(
+                    f"💡 Mesajul pare să fie despre {_det_label}, dar ești pe {_sel_label}. "
+                    f"Schimbă materia din sidebar dacă vrei răspuns specializat.",
+                    icon="⚠️"
+                )
+                st.session_state[f"_mismatch_warned_{st.session_state.session_id}"] = True
 
     else:
         # Mod automat: detectăm materia DOAR la primul mesaj din conversație.
@@ -9936,6 +10704,10 @@ if user_input := st.chat_input("Întreabă profesorul..."):
             # și ne asigurăm că prompt-ul e corect (ex: după switch sesiune)
             if st.session_state.get("system_prompt") is None:
                 update_system_prompt_for_subject(_prev_detected)
+        elif _has_text_file_uploaded:
+            # Primul mesaj dar cu fișier text — nu detectăm din mesaj (ar fi fals positiv).
+            # Lăsăm materia nedeterminată; profesorul va răspunde generic.
+            pass
         else:
             # Chat nou sau fără materie stabilită — rulăm detecția
             _detected = detect_subject_from_text(user_input)
@@ -9963,77 +10735,299 @@ if user_input := st.chat_input("Întreabă profesorul..."):
         role_gemini = "model" if msg["role"] == "assistant" else "user"
         history_obj.append({"role": role_gemini, "parts": [msg["content"]]})
     
-    final_payload = []
-    if media_content:
-        # Prompt contextual bazat pe tipul fișierului încărcat
-        # FIX: uploaded_file poate fi out-of-scope — citim din session_state
-        _uf = st.session_state.get("_current_uploaded_file_meta", {})
-        fname = _uf.get("name", "")
-        ftype = _uf.get("type", "") or ""
-        if ftype.startswith("image/"):
-            final_payload.append(
-                "Elevul ți-a trimis o imagine. Analizează-o vizual complet: "
-                "descrie ce vezi (obiecte, persoane, text, culori, forme, diagrame, exerciții scrise de mână) "
-                "și răspunde la întrebarea elevului ținând cont de tot conținutul vizual."
-            )
-        else:
-            final_payload.append(
-                f"Elevul ți-a trimis documentul '{fname}'. "
-                "Citește și analizează tot conținutul înainte de a răspunde."
-            )
-        final_payload.append(media_content)
+    final_payload = _build_attachment_payload(media_content, text_file_content)
     final_payload.append(user_input)
 
-    # Salvăm payload-ul ÎNAINTE de apelul AI — dacă cheia se epuizează în stream,
-    # elevul poate reîncerca fără să retrimită mesajul manual.
-    st.session_state["_retry_history"] = history_obj
-    st.session_state["_retry_payload"] = final_payload
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TRADUCERE SRT ÎN BUCĂȚI — dacă fișierul e .srt și cererea implică traducere,
+    # împărțim subtitrarea în bucăți de SRT_CHUNK_SIZE replici și le traduc pe rând.
+    # Altfel, folosim flow-ul normal de chat.
+    # ═══════════════════════════════════════════════════════════════════════════
 
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-
-        # Typing indicator înainte să înceapă streaming-ul
-        message_placeholder.markdown(TYPING_HTML, unsafe_allow_html=True)
-
-        try:
-            stream_generator = run_chat_with_rotation(history_obj, final_payload)
-            first_chunk = True
-
-            for text_chunk in stream_generator:
-                full_response += text_chunk
-                if first_chunk:
-                    first_chunk = False  # typing indicator dispare la primul chunk
-
-                if "<svg" in full_response or ("<path" in full_response and "stroke=" in full_response):
-                    message_placeholder.markdown(
-                        full_response.split("<path")[0] + "\n\n*🎨 Domnul Profesor desenează...*\n\n▌"
-                    )
-                else:
-                    message_placeholder.markdown(full_response + "▌")
-
-            message_placeholder.empty()
-            render_message_with_svg(full_response)
-
-            st.session_state.messages.append({"role": "assistant", "content": full_response})
-            save_message_with_limits(st.session_state.session_id, "assistant", full_response)
-            # Răspuns reușit — curățăm datele de retry
-            st.session_state.pop("_retry_history", None)
-            st.session_state.pop("_retry_payload", None)
-
-        except Exception as e:
-            message_placeholder.empty()
-            err_str = str(e)
-            # Dacă eroarea e de cheie/quota, oferim buton de reîncercare automată
-            _is_key_err = any(x in err_str for x in ["epuizat", "invalide", "quota", "429", "API key"])
-            if _is_key_err:
-                st.warning(
-                    "⚠️ Cheia API s-a epuizat în timpul răspunsului. "
-                    "Cheia a fost schimbată automat — apasă **Reîncercați** pentru a primi răspunsul.",
-                    icon="🔑"
-                )
-                if st.button("🔄 Reîncercați răspunsul", key="_retry_after_key_error", type="primary"):
-                    st.session_state["_pending_retry"] = True
-                    st.rerun()
+    def _parse_srt_blocks(srt_text: str) -> list[dict]:
+        """Parsează SRT-ul în blocuri structurate: {index, timestamp, text}.
+        Timestamp-urile sunt extrase și salvate SEPARAT — modelul nu le va atinge."""
+        result = []
+        _ts_re     = re.compile(r'\d{2}:\d{2}:\d{2}[,.]\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}[,.]\d{3}')
+        _ts_single = re.compile(r'^\d{2}:\d{2}:\d{2}[,.]\d{3}')  # timestamp incomplet (fără -->)
+        for block in re.split(r'\n\s*\n', srt_text.strip()):
+            block = block.strip()
+            if not block:
+                continue
+            block_lines = block.splitlines()
+            if len(block_lines) < 2:
+                continue
+            idx_line = block_lines[0].strip()
+            ts_line  = block_lines[1].strip() if len(block_lines) > 1 else ""
+            if _ts_re.match(ts_line):
+                # Format normal: linia 0 = index, linia 1 = timestamp complet
+                text_lines = block_lines[2:]
+            elif _ts_re.match(idx_line):
+                # Lipsește indexul — timestamp pe prima linie
+                ts_line    = idx_line
+                idx_line   = str(len(result) + 1)
+                text_lines = block_lines[1:]
+            elif _ts_single.match(ts_line):
+                # Timestamp incomplet (ex: "00:02:27,231" fără "-->...") — îl păstrăm ca atare
+                text_lines = block_lines[2:]
+            elif _ts_single.match(idx_line):
+                ts_line    = idx_line
+                idx_line   = str(len(result) + 1)
+                text_lines = block_lines[1:]
             else:
-                st.error(f"❌ Eroare: {e}")
+                continue  # bloc complet malformat — sărim
+            text = "\n".join(text_lines).strip()
+            if text:
+                result.append({"index": idx_line, "timestamp": ts_line, "text": text})
+        return result
+
+    def _is_translation_request(text: str) -> bool:
+        """Detectează dacă utilizatorul cere o traducere."""
+        keywords = [
+            "traduc", "translat", "română", "roman", "englez", "francez", "german",
+            "spaniol", "italian", "rus", "maghiar", "trad.", "în română", "in romana",
+            "din engleză", "din engleza", "convertește", "converteste",
+        ]
+        tl = text.lower()
+        return any(kw in tl for kw in keywords)
+
+    _uf_meta = st.session_state.get("_current_uploaded_file_meta", {})
+    _is_srt  = _uf_meta.get("name", "").lower().endswith(".srt")
+    _is_trad = _is_translation_request(user_input)
+
+    SRT_CHUNK_SIZE = 200  # replici per bucată — mai mic = mai stabil
+
+    if _is_srt and _is_trad and text_file_content:
+        # ── Mod traducere SRT cu separare completă timestamps / text ──
+
+        # 1. Parsăm SRT-ul — extragem timestamp-urile O SINGURĂ DATĂ din original
+        parsed_blocks = _parse_srt_blocks(text_file_content)
+        total_blocks  = len(parsed_blocks)
+        chunks        = [parsed_blocks[i:i + SRT_CHUNK_SIZE]
+                         for i in range(0, total_blocks, SRT_CHUNK_SIZE)]
+        total_chunks  = len(chunks)
+
+        _orig_name        = _uf_meta.get("name", "subtitrare.srt")
+        _trad_name        = re.sub(r'\.srt$', '_RO.srt', _orig_name, flags=re.IGNORECASE)
+        _srt_key          = f"_srt_translation_{_orig_name}"
+        translated_blocks = []   # lista de dict {index, timestamp, text} cu textul tradus
+        _translation_done = False
+
+        with st.chat_message("assistant"):
+            progress_placeholder = st.empty()
+            progress_placeholder.info(
+                f"🎬 Traduc subtitrarea în {total_chunks} bucăți "
+                f"({total_blocks} replici total)... Bucată 1/{total_chunks}"
+            )
+
+            try:
+                for chunk_idx, chunk in enumerate(chunks, start=1):
+                    # 2. Trimitem la AI DOAR textele, numerotate simplu 1..N
+                    lines_for_ai = []
+                    for i, blk in enumerate(chunk, start=1):
+                        lines_for_ai.append(f"[{i}] {blk['text']}")
+
+                    def _make_chunk_prompt(lines, n_lines, attempt=1):
+                        strictness = (
+                            "ESTE OBLIGATORIU să traduci în română. NU returna text în engleză.\n"
+                            if attempt > 1 else ""
+                        )
+                        return (
+                            f"Ești un traducător profesionist. Traduce textele de mai jos din engleză în română.\n\n"
+                            f"{strictness}"
+                            f"REGULI:\n"
+                            f"1. Fiecare linie începe cu un număr între paranteze pătrate [N]. "
+                            f"Păstrează EXACT acel număr la începutul fiecărei linii traduse.\n"
+                            f"2. Traduce DOAR textul după [N], înlocuiește complet engleza cu română.\n"
+                            f"3. NU adăuga linii noi, NU omite linii, NU adăuga explicații.\n"
+                            f"4. Numărul de linii din răspuns trebuie să fie EXACT {n_lines}.\n"
+                            f"5. Păstrează tagurile HTML dacă există (<i>, <b>, etc.).\n\n"
+                            f"TEXTE DE TRADUS:\n" + "\n".join(lines)
+                        )
+
+                    def _is_mostly_romanian(translation_map: dict, chunk_size: int) -> bool:
+                        """Verifică dacă cel puțin 60% din traduceri conțin diacritice românești
+                        sau sunt evident în română. Dacă mai puțin — considerăm că a rămas în engleză."""
+                        if not translation_map:
+                            return False
+                        ro_chars = set('ăâîșțĂÂÎȘȚ')
+                        ro_count = sum(
+                            1 for txt in translation_map.values()
+                            if any(c in ro_chars for c in txt)
+                            or not any(c.isalpha() for c in txt)  # linie fără text (ex: doar simboluri)
+                        )
+                        # Dacă avem și puține traduceri returnate (model a omis linii) → reîncercăm
+                        if len(translation_map) < chunk_size * 0.5:
+                            return False
+                        return ro_count >= len(translation_map) * 0.4
+
+                    # Încearcă traducerea cu până la 3 reîncercări automate
+                    MAX_RETRIES = 3
+                    translation_map = {}
+                    for attempt in range(1, MAX_RETRIES + 1):
+                        chunk_response = ""
+                        for text_chunk in run_chat_with_rotation([], [_make_chunk_prompt(lines_for_ai, len(chunk), attempt)]):
+                            chunk_response += text_chunk
+
+                        # Curățăm markdown fences
+                        chunk_response = re.sub(r'```[a-zA-Z]*\n?', '', chunk_response.strip())
+                        chunk_response = chunk_response.strip()
+
+                        # Parsăm răspunsul
+                        translation_map = {}
+                        for line in chunk_response.splitlines():
+                            line = line.strip()
+                            m = re.match(r'\[(\d+)\]\s*(.*)', line)
+                            if m:
+                                n   = int(m.group(1))
+                                txt = m.group(2).strip()
+                                if txt:
+                                    translation_map[n] = txt
+
+                        if _is_mostly_romanian(translation_map, len(chunk)):
+                            break  # traducere OK — ieșim din loop de retry
+
+                        # Traducere proastă — actualizăm progress și reîncercăm
+                        if attempt < MAX_RETRIES:
+                            progress_placeholder.warning(
+                                f"⚠️ Bucata {chunk_idx}/{total_chunks} a rămas în engleză "
+                                f"— reîncercare {attempt}/{MAX_RETRIES - 1}..."
+                            )
+                        else:
+                            # Toate reîncercările au eșuat — păstrăm ce avem (poate fi parțial tradus)
+                            progress_placeholder.warning(
+                                f"⚠️ Bucata {chunk_idx}/{total_chunks}: traducerea automată a eșuat "
+                                f"după {MAX_RETRIES} încercări — s-a păstrat textul original."
+                            )
+
+                    # 4. Reconstruim blocurile cu timestamp-urile ORIGINALE + textul tradus
+                    for i, blk in enumerate(chunk, start=1):
+                        translated_text = translation_map.get(i, blk["text"])  # fallback = original
+                        translated_blocks.append({
+                            "index":     blk["index"],
+                            "timestamp": blk["timestamp"],   # 100% original, neatins de AI
+                            "text":      translated_text,
+                        })
+
+                    # Actualizăm progresul
+                    done_count = min(chunk_idx * SRT_CHUNK_SIZE, total_blocks)
+                    progress_placeholder.info(
+                        f"🎬 Tradus {chunk_idx}/{total_chunks} bucăți "
+                        f"({done_count}/{total_blocks} replici)"
+                        + (f"... Bucată {chunk_idx + 1}/{total_chunks} în curs..."
+                           if chunk_idx < total_chunks else " ✅")
+                    )
+
+                # 5. Asamblăm fișierul SRT final
+                srt_output_parts = []
+                for blk in translated_blocks:
+                    srt_output_parts.append(f"{blk['index']}\n{blk['timestamp']}\n{blk['text']}")
+                full_translation = "\n\n".join(srt_output_parts)
+
+                progress_placeholder.success(
+                    f"✅ Traducere completă! {total_blocks} replici traduse în {total_chunks} bucăți."
+                )
+
+                # Salvăm în session_state
+                st.session_state[_srt_key] = {
+                    "text":      full_translation,
+                    "filename":  _trad_name,
+                    "orig_name": _orig_name,
+                    "blocks":    total_blocks,
+                }
+
+                # Mesaj vizibil în chat (marker compact)
+                _save_content = (
+                    f"✅ Traducere completă: {total_blocks} replici din '{_orig_name}'.\n"
+                    f"[SRT_TRANSLATION_KEY:{_srt_key}]"
+                )
+                st.session_state.messages.append({"role": "assistant", "content": _save_content})
+                save_message_with_limits(st.session_state.session_id, "assistant", _save_content)
+
+                # Mesaj ascuns cu textul SRT complet — role "srt_data", invizibil în chat,
+                # folosit exclusiv pentru restaurarea după refresh/reload
+                _srt_backup_content = f"[SRT_DATA:{_srt_key}]\n{full_translation}"
+                save_message_with_limits(st.session_state.session_id, "srt_data", _srt_backup_content)
+
+                _translation_done = True
+
+            except Exception as e:
+                progress_placeholder.empty()
+                err_str = str(e)
+                _is_key_err = any(x in err_str for x in ["epuizat", "invalide", "quota", "429", "API key"])
+                if _is_key_err:
+                    _show_ai_error(e, "traducere SRT")
+                else:
+                    _show_ai_error(e, "traducere SRT")
+
+        # ── Butonul de descărcare — ÎN AFARA with st.chat_message ──
+        # Folosim session_state pentru date, cheie FIXĂ (nu depinde de _orig_name variabil)
+        # ca să fie vizibil și după rerun-uri.
+        _srt_ready = st.session_state.get(_srt_key) if _translation_done else None
+        if _srt_ready:
+            st.markdown(f"**📄 Subtitrare tradusă — {_srt_ready['blocks']} replici:**")
+            st.download_button(
+                label="⬇️ Descarcă subtitrarea tradusă (.srt)",
+                data=_srt_ready["text"].encode("utf-8"),
+                file_name=_srt_ready["filename"],
+                mime="text/plain",
+                use_container_width=True,
+                key="_dl_srt_fresh",
+            )
+            # Afișăm TOT fișierul tradus în chat — fără trunchiere
+            st.text(_srt_ready["text"])
+
+
+    else:
+        # ── Flow normal de chat (non-SRT sau non-traducere) ──
+
+        # Salvăm payload-ul ÎNAINTE de apelul AI — dacă cheia se epuizează în stream,
+        # elevul poate reîncerca fără să retrimită mesajul manual.
+        st.session_state["_retry_history"] = history_obj
+        st.session_state["_retry_payload"] = final_payload
+
+        with st.chat_message("assistant"):
+            message_placeholder = st.empty()
+            full_response = ""
+
+            # Typing indicator înainte să înceapă streaming-ul
+            message_placeholder.markdown(TYPING_HTML, unsafe_allow_html=True)
+
+            try:
+                stream_generator = run_chat_with_rotation(history_obj, final_payload)
+                first_chunk = True
+
+                for text_chunk in stream_generator:
+                    full_response += text_chunk
+                    if first_chunk:
+                        first_chunk = False  # typing indicator dispare la primul chunk
+
+                    if "<svg" in full_response or ("<path" in full_response and "stroke=" in full_response):
+                        message_placeholder.markdown(
+                            full_response.split("<path")[0] + "\n\n*🎨 Domnul Profesor desenează...*\n\n▌"
+                        )
+                    else:
+                        message_placeholder.markdown(full_response + "▌")
+
+                message_placeholder.empty()
+                render_message_with_svg(full_response)
+
+                st.session_state.messages.append({"role": "assistant", "content": full_response})
+                save_message_with_limits(st.session_state.session_id, "assistant", full_response)
+                # Răspuns reușit — curățăm datele de retry
+                st.session_state.pop("_retry_history", None)
+                st.session_state.pop("_retry_payload", None)
+
+            except Exception as e:
+                message_placeholder.empty()
+                err_str = str(e)
+                # Dacă eroarea e de cheie/quota, oferim buton de reîncercare automată
+                _is_key_err = any(x in err_str for x in ["epuizat", "invalide", "quota", "429", "API key"])
+                if _is_key_err:
+                    _show_ai_error(e, "chat")
+                    # on_click: butonul nu mai e randat la rerun-ul de după click (blocul e one-shot),
+                    # deci un `if st.button(...)` nu s-ar declanșa niciodată; callback-ul rulează oricum.
+                    st.button("🔄 Reîncercați răspunsul", key="_retry_after_key_error", type="primary",
+                              on_click=_request_retry)
+                else:
+                    _show_ai_error(e, "chat")
