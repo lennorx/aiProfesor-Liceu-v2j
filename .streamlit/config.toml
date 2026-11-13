@@ -1,0 +1,7 @@
+[server]
+headless = true
+maxUploadSize = 100
+
+[browser]
+# Fără statistici trimise către Streamlit/Snowflake (date personale ale elevilor)
+gatherUsageStats = false
